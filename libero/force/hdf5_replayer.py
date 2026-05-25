@@ -1,7 +1,9 @@
 import os
 import h5py
 import json
+import re
 import numpy as np
+from typing import Union, Tuple, Dict, Any, Optional, List
 from PIL import Image
 from tqdm import tqdm
 
@@ -10,6 +12,8 @@ from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 
 from libero.force.modules import MujocoSensorReader, WrenchObsWrapper
+from libero.force.physics_helper import PhysicsHelper
+from libero.force.visual_helper import VisualHelper
 
 from robokit.debug_utils.printer import print_batch
 from robokit.debug_utils.images import (
@@ -26,6 +30,8 @@ class HDF5Replayer:
             libero_code_root: str = "/home/geyuan/code/LIBERO-FT/",
             bddl_path: str = None,
             benchmark_task_suite_name: str = None,  # in `libero_{10/90/object/goal/spatial}`
+            # PhysicsHelper params
+            phy_keywords: tuple = ("cabinet", "drawer", "door", "basket", "object", "tool"),
     ):
         self.hdf5_read_path = hdf5_read_path
         self.camera_hw = camera_hw
@@ -42,8 +48,8 @@ class HDF5Replayer:
                 self.hdf5_env_kwargs = hdf5_env_meta["env_kwargs"]
                 self.hdf5_env_kwargs.update({
                     "bddl_file_name": self.bddl_path,
-                    "camera_heights": 128,
-                    "camera_widths": 128,
+                    "camera_heights": self.camera_hw[0],
+                    "camera_widths": self.camera_hw[1],
                 })
                 if "controller_configs" in self.hdf5_env_kwargs:
                     del self.hdf5_env_kwargs["controller_configs"]
@@ -58,6 +64,17 @@ class HDF5Replayer:
             self.bddl_path = os.path.join(
                 get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
         self.init_env()
+
+        # 1) PhysicsHelper for dynamics randomization
+        self.physics_helper = PhysicsHelper(
+            self.env.env.sim.model,
+            object_keywords=phy_keywords,
+            random_seed=self.env_seed,
+        )
+        self.visual_helper = VisualHelper(
+            self.env.env.sim.model,
+        )
+
         print("[Info] HDF5Replayer initialized with BDDL:", self.bddl_path)
 
     def init_env(self):
@@ -74,6 +91,114 @@ class HDF5Replayer:
 
     def close_env(self):
         self.env.close()
+
+    def apply_physics_shift(
+            self,
+            frictionloss_scale: Tuple[float, float] = (0.5, 2.0),
+            damping_scale: Tuple[float, float] = (0.5, 2.0),
+            sliding_friction_scale: Tuple[float, float] = (0.7, 1.3),
+            gravity_z_range: Tuple[float, float] = (-10.3, -9.3),
+            tweak_solref_range: Tuple[float, float] = (0.8, 1.2),
+            rng: np.random.RandomState = None,
+            verbose: bool = False,
+    ):
+        if frictionloss_scale is None and damping_scale is None and sliding_friction_scale is None \
+                and gravity_z_range is None and tweak_solref_range is None:
+            print(f"[Info] Force shift ranges are not provided, skipping applying physics shift.")
+            return  # do nothing
+        self.physics_helper.apply_dynamics_shift(
+            model=self.env.env.sim.model,  # NOTE: don't know why, but we have to resend the sim.model here
+            frictionloss_scale=frictionloss_scale,
+            damping_scale=damping_scale,
+            sliding_friction_scale=sliding_friction_scale,
+            gravity_z_range=gravity_z_range,
+            tweak_solref_range=tweak_solref_range,
+            rng=rng,
+            verbose=verbose,
+        )
+        self.env.env.sim.forward()
+        if verbose:
+            print(f"[Info] Applied physics shift. gravity={self.env.env.sim.model.opt.gravity}, "
+                  f"friction/damping/sliding={damping_scale}, solref={tweak_solref_range}.")
+
+    def restore_physics(self):
+        self.physics_helper.restore_original_params()
+
+    def regenerate_obs_from_current_state(self):
+        sim_state = self.env.env.get_sim_state()
+        obs = self.env.env.regenerate_obs_from_state(sim_state)
+        obs["wrench_ee"] = self.env.read_wrench_from_sim()
+        return obs
+
+    def apply_visual_shift(
+            self,
+            table_center_xyz: tuple = None,
+            darken: bool = False,
+            color_light: bool = False,
+            texture: bool = False,
+            texture_dir: str = "images/dtd/",
+            camera_shift: bool = False,
+            rng: np.random.RandomState = None,
+            verbose: bool = False,
+    ) -> Dict[str, Any]:
+        if (not darken) and (not color_light) and (not texture) and (not camera_shift):
+            return {"applied": False, "reset_applied": False}
+        self.visual_helper.clear_dynamic_light_base()
+        self.visual_helper.clear_camera_shift_base()
+
+        texture_info = None
+        flashlight_info = None
+        color_info = None
+        camera_info = None
+        if texture:
+            texture_info = self.visual_helper.apply_table_texture_via_xml_wrapper(
+                texture_dir=texture_dir,
+                env=self.env,
+                preferred_material_names=("desk", "table_texture", "table_mat"),
+                apply_to_all_keyword_textures=True,
+                reset_env=True,
+                rng=rng,
+                verbose=verbose,
+            )
+            # reset_from_xml_string may rebuild sim/model; refresh helper model pointers.
+            self.physics_helper.model = self.env.env.sim.model
+            if getattr(self.env, "reader", None) is not None:
+                self.env.reader = None
+
+        if darken or color_light:
+            light_info = self.visual_helper.apply_color_and_darken(
+                model=self.env.env.sim.model,
+                rng=rng,
+                darken=darken,
+                color_light=color_light,
+                table_center_xyz=table_center_xyz if table_center_xyz is not None else (0.0, 0.0, 0.9),
+                table_half_size_xy=(0.05, 0.10),
+                preserve_luminance=True,
+                verbose=verbose,
+            )
+            flashlight_info = light_info.get("flashlight_info")
+            color_info = light_info.get("color_info")
+
+        if camera_shift:
+            camera_info = self.visual_helper.apply_camera_shift(
+                model=self.env.env.sim.model,
+                rng=rng,
+                verbose=verbose,
+            )
+        self.env.env.sim.forward()
+        return {
+            "applied": True,
+            "reset_applied": bool(texture_info.get("reset_applied", False)) if texture_info is not None else False,
+            "texture_info": texture_info,
+            "flashlight_info": flashlight_info,
+            "color_info": color_info,
+            "camera_info": camera_info,
+        }
+
+    def restore_visual(self):
+        self.visual_helper.restore_original_params(model=self.env.env.sim.model)
+        self.visual_helper.clear_dynamic_light_base()
+        self.visual_helper.clear_camera_shift_base()
 
     def vis_hdf5_contents(self, hdf5_path: str = None,
                           save_videos: bool = False,
@@ -166,9 +291,27 @@ class HDF5Replayer:
             hdf5_save_path: str = "tmp_replayed_wrench.hdf5",
             video_save_dir: str = None,
             save_max_videos: int = 1,
+            replay_seed: int = None,
+            retry_with_reset: int = 5,
+            # physical shift related
+            friction_scale: float = 1.,
+            gz_scale: float = 1.,
+            solref_scale: float = 1.,
+            # visual shift related
+            table_center_xyz: tuple = None,
+            darken: bool = False,
+            color_light: bool = False,
+            texture: bool = False,
+            texture_dir: str = "images/dtd/",
+            camera_shift: bool = False,
+            demo_slices: Optional[Union[slice, str, Tuple[Union[slice, str], ...]]] = None,
     ):
         hdf5_read_path = self.hdf5_read_path if hdf5_read_path is None else hdf5_read_path
         assert os.path.exists(hdf5_read_path), f"hdf5_read_path={hdf5_read_path} does not exist!"
+        if replay_seed is None:
+            replay_seed = self.env_seed
+
+        use_force_shift = (friction_scale != 1.) or (gz_scale != 1.) or (solref_scale != 1.)
 
         with h5py.File(hdf5_read_path, "r") as fin, h5py.File(hdf5_save_path, "w") as fout:
             # 复制全局 attrs（如果有）
@@ -180,8 +323,20 @@ class HDF5Replayer:
             num_out_attrs = self.copy_attrs(fin["data"], fout["data"])
             print(f"Copied {num_out_attrs} 'data' group attributes from input to output HDF5")
 
-            success_stats = {}
-            demo_keys = sorted(list(fin["data"].keys()), key=lambda x: int(x.split("_")[1]))
+            success_stats = {"total": 0}
+            all_demo_keys = sorted(list(fin["data"].keys()), key=lambda x: int(x.split("_")[1]))
+            demo_keys = self._select_demo_keys(all_demo_keys, demo_slices=demo_slices)
+            if len(demo_keys) == 0:
+                raise ValueError(
+                    f"demo_slices={demo_slices} selected 0 demos out of {len(all_demo_keys)}. "
+                    f"Available demo index range: [0:{len(all_demo_keys)})."
+                )
+            print(
+                f"[Info] Selected {len(demo_keys)}/{len(all_demo_keys)} demos for replay "
+                f"with demo_slices={demo_slices}."
+            )
+            if "num_demos" in fout["data"].attrs:
+                fout["data"].attrs["num_demos"] = len(demo_keys)
             for iter_idx, demo_key in enumerate(  # e.g., "demo_0", "demo_1", ...
                     tqdm(demo_keys,"Replay by actions")
             ):
@@ -191,25 +346,40 @@ class HDF5Replayer:
                 self.copy_attrs(g_in, g_out)
 
                 replay_results = self._replay_actions_and_save_hdf5(
-                    g_in, g_out, demo_key, action_shift=1
+                    g_in, g_out, demo_key, action_shift=1,
+                    replay_seed=replay_seed,
+                    retry_with_reset=retry_with_reset,
+                    friction_scale=friction_scale,
+                    gz_scale=gz_scale,
+                    solref_scale=solref_scale,
+                    table_center_xyz=table_center_xyz,
+                    darken=darken,
+                    color_light=color_light,
+                    texture=texture,
+                    texture_dir=texture_dir,
+                    camera_shift=camera_shift,
                 )
                 success = replay_results["success"]  # bool
                 wrenches = replay_results["wrenches"]  # (T,6)
                 reset_every = replay_results["reset_every"]  # int
                 vis_hdf5_images = replay_results["vis_hdf5_images"]  # list of (H,W,3)
                 vis_replay_images = replay_results["vis_replay_images"]  # list of (H,W,3)
+                num_tries = replay_results["num_tries"]
 
                 if iter_idx < save_max_videos and video_save_dir is not None:  # only visualize first 10 demos
                     os.makedirs(video_save_dir, exist_ok=True)
-                    force_frames, _, _ = plot_force_sensor_wrt_time(wrenches)
                     vis_images = [
                         concatenate_rgb_images(hdf5_image, replay_image, resize_ratio=1.)
                         for hdf5_image, replay_image in zip(vis_hdf5_images, vis_replay_images)
                     ]
-                    combined_vis_images = [
-                        concatenate_rgb_images(img, force_img, resize_ratio=1.)
-                        for img, force_img in zip(vis_images, force_frames)
-                    ]
+                    if use_force_shift:
+                        force_frames, _, _ = plot_force_sensor_wrt_time(wrenches)
+                        combined_vis_images = [
+                            concatenate_rgb_images(img, force_img, resize_ratio=1.)
+                            for img, force_img in zip(vis_images, force_frames)
+                        ]
+                    else:
+                        combined_vis_images = vis_images
                     save_frames_as_video(
                         combined_vis_images,
                         f"{video_save_dir}/replay_{iter_idx:02d}_"
@@ -219,12 +389,82 @@ class HDF5Replayer:
                     # break  # only do one demo for now
 
                 if not success:
-                    print(f"[Warning] {demo_key} failed with 2 tries.")
+                    print(f"[Warning] {demo_key} failed with {num_tries} tries.")
                 success_stats[
                     f"reset={reset_every}_success={success}"
                 ] = success_stats.get(f"reset={reset_every}_success={success}", 0) + 1
+                success_stats["total"] += 1
+                replay_seed += 1
 
             print(f"Replay done. Success count: {success_stats}")
+        return success_stats
+
+    @staticmethod
+    def _parse_demo_slice_token(token: str) -> slice:
+        token = token.strip()
+        if not (token.startswith("[") and token.endswith("]")):
+            raise ValueError(f"Invalid demo slice token: {token}. Expected format like [20:] or [:10].")
+        body = token[1:-1].strip()
+        if body == "":
+            return slice(None, None, None)
+        if ":" not in body:
+            idx = int(body)
+            return slice(idx, idx + 1, 1)
+
+        parts = body.split(":")
+        if len(parts) > 3:
+            raise ValueError(f"Invalid demo slice token: {token}. Too many ':' in slice.")
+        values = [None if p.strip() == "" else int(p.strip()) for p in parts]
+        while len(values) < 3:
+            values.append(None)
+        return slice(values[0], values[1], values[2])
+
+    @classmethod
+    def _normalize_demo_slices(
+            cls,
+            demo_slices: Optional[Union[slice, str, Tuple[Union[slice, str], ...], List[Any]]],
+    ) -> List[slice]:
+        if demo_slices is None:
+            return [slice(None, None, None)]
+        if isinstance(demo_slices, slice):
+            return [demo_slices]
+        if isinstance(demo_slices, str):
+            tokens = re.findall(r"\[[^\[\]]*\]", demo_slices)
+            if not tokens:
+                raise ValueError(
+                    f"Invalid demo_slices={demo_slices}. "
+                    f"Use formats like [20:] or ([40:], [:10])."
+                )
+            return [cls._parse_demo_slice_token(tok) for tok in tokens]
+        if isinstance(demo_slices, (tuple, list)):
+            out: List[slice] = []
+            for item in demo_slices:
+                out.extend(cls._normalize_demo_slices(item))
+            return out
+        raise TypeError(
+            f"Unsupported demo_slices type: {type(demo_slices)}. "
+            f"Supported: None, slice, str, tuple/list of slice or str."
+        )
+
+    @classmethod
+    def _select_demo_keys(
+            cls,
+            all_demo_keys: List[str],
+            demo_slices: Optional[Union[slice, str, Tuple[Union[slice, str], ...], List[Any]]] = None,
+    ) -> List[str]:
+        if demo_slices is None:
+            return list(all_demo_keys)
+        slice_list = cls._normalize_demo_slices(demo_slices)
+        selected_indices = []
+        seen = set()
+        n = len(all_demo_keys)
+        for slc in slice_list:
+            for idx in range(*slc.indices(n)):
+                if idx in seen:
+                    continue
+                seen.add(idx)
+                selected_indices.append(idx)
+        return [all_demo_keys[i] for i in selected_indices]
 
     def _replay_actions_and_save_hdf5(
             self,
@@ -232,6 +472,19 @@ class HDF5Replayer:
             g_out: h5py.Group,
             demo_key: str,
             action_shift: int= 1,  # to align with states
+            replay_seed: int = None,
+            retry_with_reset: int = -1,  # `-1` means not enabled
+            # physical shift related
+            friction_scale: float = 1.,
+            gz_scale: float = 1.,
+            solref_scale: float = 1.,
+            # visual shift related
+            table_center_xyz: tuple = None,
+            darken: bool = False,
+            color_light: bool = False,
+            texture: bool = False,
+            texture_dir: str = "images/dtd/",
+            camera_shift: bool = False,
     ):
         """
         # In HDF5:
@@ -342,8 +595,64 @@ class HDF5Replayer:
         #         f"Sim state shape {sim_state.shape} does not match hdf5 state shape {hdf5_states[0].shape}!"
         env.set_flattened_state_and_forward(hdf5_states[0])  # set as the 1st state of hdf5 demo
 
-        obs = env.env.regenerate_obs_from_state(hdf5_states[0])
-        obs["wrench_ee"] = env.read_wrench_from_sim()
+        # add physics randomization here if needed
+        possible_gz_range = None
+        possible_friction_range = None
+        possible_solref_range = None
+        if friction_scale != 1.0 or gz_scale != 1.0 or solref_scale != 1.0:
+            if gz_scale > 1.0:
+                possible_gz_range = (-9.81 * (1 + gz_scale), -9.81)
+            elif gz_scale < 1.0:
+                possible_gz_range = (-9.81 * (gz_scale ** 2), -9.81 * gz_scale)
+            else:
+                pass
+
+            if friction_scale > 1.0:
+                possible_friction_range = (friction_scale, friction_scale ** 2)
+            elif friction_scale < 1.0:
+                possible_friction_range = (friction_scale ** 2, friction_scale)
+            else:
+                pass
+
+            if solref_scale > 1.0:
+                possible_solref_range = (solref_scale, solref_scale ** 2)
+            elif solref_scale < 1.0:
+                possible_solref_range = (solref_scale ** 2, solref_scale)
+            else:
+                pass
+
+        use_dynamic_color_light = bool(color_light)
+        visual_info = self.apply_visual_shift(
+            table_center_xyz=table_center_xyz,
+            darken=darken,
+            color_light=False,
+            texture=texture,
+            texture_dir=texture_dir,
+            camera_shift=camera_shift,
+            rng=np.random.RandomState(replay_seed),
+            verbose=True,
+        )
+        if visual_info.get("reset_applied", False):
+            # Texture XML reset may rebuild sim/model and discard the demo state.
+            env.set_flattened_state_and_forward(hdf5_states[0])
+        self.apply_physics_shift(
+            frictionloss_scale=possible_friction_range,
+            damping_scale=possible_friction_range,
+            sliding_friction_scale=possible_friction_range,
+            gravity_z_range=possible_gz_range,
+            tweak_solref_range=possible_solref_range,
+            rng=np.random.RandomState(replay_seed),
+            verbose=True,
+        )
+        if use_dynamic_color_light:
+            self.visual_helper.capture_dynamic_light_base(model=env.env.sim.model)
+            self.visual_helper.apply_dynamic_rainbow_light(
+                model=env.env.sim.model,
+                step_idx=0,
+            )
+            env.env.sim.forward()
+
+        obs = self.regenerate_obs_from_current_state()
         reward = 0
         sim_state = env.env.get_sim_state()
 
@@ -351,6 +660,7 @@ class HDF5Replayer:
 
         # 4) step through actions
         # 4.1) try to fully rollout without resets, we'll handle all the env states by ourselves
+        num_tries = 1
         reset_every = -1  # do not reset
         for t in range(0, T_out):
             vis_replay_images.append(
@@ -375,6 +685,12 @@ class HDF5Replayer:
             states_out[t] = sim_state
 
             ## Option 2. Step with actions
+            if use_dynamic_color_light:
+                self.visual_helper.apply_dynamic_rainbow_light(
+                    model=env.env.sim.model,
+                    step_idx=t,
+                )
+                env.env.sim.forward()
             obs, reward, done, info = env.step(hdf5_actions[t + action_shift])
             sim_state = env.env.get_sim_state()
 
@@ -390,14 +706,41 @@ class HDF5Replayer:
 
         # 4.2) try to reset every N steps to reduce compounding errors, we'll copy the states from hdf5
         #      Although this can also fail, but since we do not load states from env, it's ok to read force data
-        if not success:
+        if retry_with_reset >= 1 and not success:
+            num_tries += 1
             print(f"[Warning] 1st try to replay ({demo_key}) failed, will make 2nd try with periodic resets...")
             env.reset()
-            env.set_flattened_state_and_forward(hdf5_states[0])  # set as the 1st state of hdf5 demo
-            obs = env.env.regenerate_obs_from_state(hdf5_states[0])
-            obs["wrench_ee"] = env.read_wrench_from_sim()
+            _ = self.apply_visual_shift(
+                table_center_xyz=table_center_xyz,
+                darken=darken,
+                color_light=False,
+                texture=texture,
+                texture_dir=texture_dir,
+                camera_shift=camera_shift,
+                rng=np.random.RandomState(replay_seed),
+                verbose=True,
+            )
+            self.apply_physics_shift(
+                frictionloss_scale=possible_friction_range,
+                damping_scale=possible_friction_range,
+                sliding_friction_scale=possible_friction_range,
+                gravity_z_range=possible_gz_range,
+                tweak_solref_range=possible_solref_range,
+                rng=np.random.RandomState(replay_seed),
+                verbose=True,
+            )
+            # Set demo state after shifts (texture shift may internally reset XML/sim).
+            env.set_flattened_state_and_forward(hdf5_states[0])
+            if use_dynamic_color_light:
+                self.visual_helper.capture_dynamic_light_base(model=env.env.sim.model)
+                self.visual_helper.apply_dynamic_rainbow_light(
+                    model=env.env.sim.model,
+                    step_idx=0,
+                )
+                env.env.sim.forward()
+            obs = self.regenerate_obs_from_current_state()
             vis_replay_images = []  # reset
-            reset_every = 5  # reset sim state every N steps to reduce compounding errors
+            reset_every = retry_with_reset  # reset sim state every N steps to reduce compounding errors
 
             for t in range(0, T_out):
                 vis_replay_images.append(
@@ -425,6 +768,12 @@ class HDF5Replayer:
                     ## Option 1. Very direct way: set flattened state
                     env.set_flattened_state_and_forward(hdf5_states[t])
                 ## Option 2. Step with actions
+                if use_dynamic_color_light:
+                    self.visual_helper.apply_dynamic_rainbow_light(
+                        model=env.env.sim.model,
+                        step_idx=t,
+                    )
+                    env.env.sim.forward()
                 obs, reward, done, info = env.step(hdf5_actions[t + action_shift])
                 assert "wrench_ee" in obs, "Wrench obs missing in env!"
                 sim_state = env.env.get_sim_state()
@@ -459,6 +808,7 @@ class HDF5Replayer:
         g_out.create_dataset("actions", data=hdf5_actions[action_shift:], dtype="float64")
 
         g_out.create_dataset("replay_reset_every", data=np.array([reset_every], dtype=np.int8), dtype="int8")
+        g_out.create_dataset("replay_success", data=np.array([int(success)], dtype=np.int8), dtype="int8")
 
         return {
             "success": success,
@@ -466,6 +816,7 @@ class HDF5Replayer:
             "vis_replay_images": vis_replay_images,
             "wrenches": wrenches,
             "reset_every": reset_every,  # -1 means no resets, >=1 means reset every N steps
+            "num_tries": num_tries,
         }
 
     @staticmethod
@@ -498,5 +849,3 @@ class HDF5Replayer:
             "p01": np.percentile(x, 1, axis=0),
             "p99": np.percentile(x, 99, axis=0),
         }
-
-
