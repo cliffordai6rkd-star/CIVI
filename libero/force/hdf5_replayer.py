@@ -30,12 +30,16 @@ class HDF5Replayer:
             libero_code_root: str = "/home/geyuan/code/LIBERO-FT/",
             bddl_path: str = None,
             benchmark_task_suite_name: str = None,  # in `libero_{10/90/object/goal/spatial}`
+            retry_obs_source: str = "hdf5",
             # PhysicsHelper params
             phy_keywords: tuple = ("cabinet", "drawer", "door", "basket", "object", "tool"),
     ):
+        assert retry_obs_source in ("hdf5", "env"), \
+            f"retry_obs_source must be 'hdf5' or 'env', got {retry_obs_source}."
         self.hdf5_read_path = hdf5_read_path
         self.camera_hw = camera_hw
         self.env_seed = env_seed
+        self.retry_obs_source = retry_obs_source
 
         # 0) Create env
         assert (hdf5_read_path is not None or
@@ -739,6 +743,8 @@ class HDF5Replayer:
                 )
                 env.env.sim.forward()
             obs = self.regenerate_obs_from_current_state()
+            reward = 0
+            sim_state = env.env.get_sim_state()
             vis_replay_images = []  # reset
             reset_every = retry_with_reset  # reset sim state every N steps to reduce compounding errors
 
@@ -752,17 +758,29 @@ class HDF5Replayer:
                     )
                 )
 
-                agent_rgb[t] = hdf5_obs["agentview_rgb"][t]
-                eyeinhand_rgb[t] = hdf5_obs["eye_in_hand_rgb"][t]
                 wrenches[t] = obs["wrench_ee"]  # NOTE: always from sim
-                ee_ori[t] = hdf5_obs["ee_ori"][t]
-                ee_pos[t] = hdf5_obs["ee_pos"][t]
-                ee_states[t] = hdf5_obs["ee_states"][t]
-                gripper_states[t] = hdf5_obs["gripper_states"][t]
-                joint_states[t] = hdf5_obs["joint_states"][t]
-                rewards_out[t] = hdf5_rewards[t]
-                robot_states_out[t] = hdf5_robot_states[t]
-                states_out[t] = hdf5_states[t]
+                if self.retry_obs_source == "hdf5":
+                    agent_rgb[t] = hdf5_obs["agentview_rgb"][t]
+                    eyeinhand_rgb[t] = hdf5_obs["eye_in_hand_rgb"][t]
+                    ee_ori[t] = hdf5_obs["ee_ori"][t]
+                    ee_pos[t] = hdf5_obs["ee_pos"][t]
+                    ee_states[t] = hdf5_obs["ee_states"][t]
+                    gripper_states[t] = hdf5_obs["gripper_states"][t]
+                    joint_states[t] = hdf5_obs["joint_states"][t]
+                    rewards_out[t] = hdf5_rewards[t]
+                    robot_states_out[t] = hdf5_robot_states[t]
+                    states_out[t] = hdf5_states[t]
+                else:
+                    agent_rgb[t] = obs["agentview_image"]
+                    eyeinhand_rgb[t] = obs["robot0_eye_in_hand_image"]
+                    ee_ori[t] = self.quat_xyzw_to_rotvec(obs["robot0_eef_quat"])
+                    ee_pos[t] = obs["robot0_eef_pos"]
+                    ee_states[t] = np.concatenate((ee_pos[t], ee_ori[t]), axis=0)
+                    gripper_states[t] = obs["robot0_gripper_qpos"]
+                    joint_states[t] = obs["robot0_joint_pos"]
+                    rewards_out[t] = int(reward)
+                    robot_states_out[t] = np.concatenate((gripper_states[t], ee_pos[t], obs["robot0_eef_quat"]), axis=0)
+                    states_out[t] = sim_state
 
                 if t % reset_every == (reset_every - 1):
                     ## Option 1. Very direct way: set flattened state
@@ -809,6 +827,7 @@ class HDF5Replayer:
 
         g_out.create_dataset("replay_reset_every", data=np.array([reset_every], dtype=np.int8), dtype="int8")
         g_out.create_dataset("replay_success", data=np.array([int(success)], dtype=np.int8), dtype="int8")
+        g_out.attrs["retry_obs_source"] = self.retry_obs_source
 
         return {
             "success": success,

@@ -2,7 +2,7 @@ import os
 import re
 import numpy as np
 import requests
-from typing import Tuple, Optional, List, Dict, Any, Union
+from typing import Tuple, Optional, List, Dict, Any, Union, Sequence
 from tqdm import tqdm
 
 import torch
@@ -12,6 +12,7 @@ from libero.libero.envs import OffScreenRenderEnv
 
 from libero.force.modules import WrenchObsWrapper
 from libero.force.physics_helper import PhysicsHelper
+from libero.force.visual_helper import VisualHelper
 from libero.force.hdf5_replayer import HDF5Replayer
 from libero.force.hdf5_to_task import get_task_from_hdf5
 from libero.force.utils import dict_apply
@@ -97,6 +98,10 @@ class SingleForceEnv:
             object_keywords=phy_keywords,
             random_seed=self.env_seed,
         )
+        self.visual_helper = VisualHelper(
+            self.env.env.sim.model,
+            random_seed=self.env_seed,
+        )
         # Note: usage: apply_dynamics_shift; restore_original_params;
 
         print("[Info] SingleForceEnv initialized with BDDL:", self.bddl_path)
@@ -120,10 +125,25 @@ class SingleForceEnv:
         self.env.seed(self.env_seed)
         self.env.reset()
         self.step_cnt = 0
+        if hasattr(self, "visual_helper"):
+            self.visual_helper.clear_dynamic_light_base()
+            self.visual_helper.clear_camera_shift_base()
 
     def reset_to_benchmark_init(self, init_state_id=0, settle_steps=5, env_seed: Optional[int] = None):
         self.reset_env(env_seed=env_seed)
         self.env.set_init_state(self.init_states[init_state_id % len(self.init_states)])
+        assert settle_steps > 0, "settle_steps must be greater than 0."
+        for _ in range(settle_steps):
+            obs, _, _, _ = self.env.step(np.zeros(7, dtype=np.float32))
+        return obs
+
+    def set_benchmark_init_without_reset(self, init_state_id=0, settle_steps=5):
+        self.step_cnt = 0
+        self.visual_helper.clear_dynamic_light_base()
+        self.visual_helper.clear_camera_shift_base()
+        self.env.set_init_state(self.init_states[init_state_id % len(self.init_states)])
+        if hasattr(self.env, "build_reader_if_needed"):
+            self.env.build_reader_if_needed()
         assert settle_steps > 0, "settle_steps must be greater than 0."
         for _ in range(settle_steps):
             obs, _, _, _ = self.env.step(np.zeros(7, dtype=np.float32))
@@ -137,6 +157,12 @@ class SingleForceEnv:
 
     def check_success(self):
         return bool(self.env.env.check_success())
+
+    def regenerate_obs_from_current_state(self):
+        sim_state = self.env.env.get_sim_state()
+        obs = self.env.env.regenerate_obs_from_state(sim_state)
+        obs["wrench_ee"] = self.env.read_wrench_from_sim()
+        return obs
 
     def apply_physics_shift(
             self,
@@ -162,6 +188,78 @@ class SingleForceEnv:
 
     def restore_physics(self):
         self.physics_helper.restore_original_params()
+
+    def apply_visual_shift(
+            self,
+            table_center_xyz: tuple = None,
+            darken: bool = False,
+            color_light: bool = False,
+            texture: bool = False,
+            texture_dir: str = "images/dtd",
+            camera_shift: bool = False,
+            rng: np.random.RandomState = None,
+            verbose: bool = False,
+    ) -> Dict[str, Any]:
+        if (not darken) and (not color_light) and (not texture) and (not camera_shift):
+            return {"applied": False, "reset_applied": False}
+        self.visual_helper.clear_dynamic_light_base()
+        self.visual_helper.clear_camera_shift_base()
+
+        texture_info = None
+        flashlight_info = None
+        color_info = None
+        camera_info = None
+
+        if texture:
+            texture_info = self.visual_helper.apply_table_texture_via_xml_wrapper(
+                texture_dir=texture_dir,
+                env=self.env,
+                preferred_material_names=("desk", "table_texture", "table_mat"),
+                apply_to_all_keyword_textures=True,
+                reset_env=True,
+                rng=rng,
+                verbose=verbose,
+            )
+            # reset_from_xml_string rebuilds sim/model, refresh helper model refs.
+            self.physics_helper.model = self.env.env.sim.model
+            if getattr(self.env, "reader", None) is not None:
+                self.env.reader = None
+
+        if darken or color_light:
+            light_info = self.visual_helper.apply_color_and_darken(
+                model=self.env.env.sim.model,
+                rng=rng,
+                darken=darken,
+                color_light=color_light,
+                table_center_xyz=table_center_xyz if table_center_xyz is not None else (0.0, 0.0, 0.9),
+                table_half_size_xy=(0.05, 0.10),
+                preserve_luminance=True,
+                verbose=verbose,
+            )
+            flashlight_info = light_info.get("flashlight_info")
+            color_info = light_info.get("color_info")
+
+        if camera_shift:
+            camera_info = self.visual_helper.apply_camera_shift(
+                model=self.env.env.sim.model,
+                rng=rng,
+                verbose=verbose,
+            )
+
+        self.env.env.sim.forward()
+        return {
+            "applied": True,
+            "reset_applied": bool(texture_info.get("reset_applied", False)) if texture_info is not None else False,
+            "texture_info": texture_info,
+            "flashlight_info": flashlight_info,
+            "color_info": color_info,
+            "camera_info": camera_info,
+        }
+
+    def restore_visual(self):
+        self.visual_helper.restore_original_params(model=self.env.env.sim.model)
+        self.visual_helper.clear_dynamic_light_base()
+        self.visual_helper.clear_camera_shift_base()
 
 
 class LiberoForceSocketEvaluator:
@@ -271,6 +369,8 @@ class LiberoForceSocketEvaluator:
                 stage_flag=stage_flag,
                 gt_video=video_B_v2_H_W_C,  # (B,Ts,H,W,3) uint8
                 tcp_state=robot_states_B_T_D,  # (B,Ts,D) float32, not used
+                num_camera_views=2,
+                max_cache_action=self.send_per_frames,
             )
 
             # print(f"[LiberoForceSocketEvaluator] sending frames, i={self.send_cnt}, per={self.send_per_frames}, "
@@ -305,9 +405,29 @@ class LiberoForceSocketEvaluator:
                  friction_scale: float = 1.,
                  gz_scale: float = 1.,
                  solref_scale: float = 1.,
+                 table_center_xyz: tuple = None,
+                 darken: bool = False,
+                 color_light: bool = False,
+                 texture: bool = False,
+                 texture_dir: str = "images/dtd/",
+                 camera_shift: bool = False,
                  vis_rollout_video: bool = False,
                  **kwargs
     ):
+        if kwargs.get("selected_light_id", None) is not None:
+            darken = True
+        use_dynamic_color_light = bool(color_light)
+        domain_shift_tags = []
+        if color_light:
+            domain_shift_tags.append("vc")
+        if texture:
+            domain_shift_tags.append("vt")
+        if camera_shift:
+            domain_shift_tags.append("vv")
+        if darken:
+            domain_shift_tags.append("vd")
+        domain_shift_str = "+".join(domain_shift_tags) if domain_shift_tags else "none"
+
         env = self.env
         env.reset_env()
 
@@ -325,10 +445,30 @@ class LiberoForceSocketEvaluator:
             ## You need to make sure this is correct for your policy.
             # self.send_reset()
             self.current_test_id = test_idx
-            obs = env.reset_to_benchmark_init(
+            _ = env.reset_to_benchmark_init(
                 init_state_id=test_idx,
                 env_seed=test_seed
             )
+
+            # add visual randomization here if needed
+            visual_info = None
+            if darken or texture or camera_shift:
+                visual_info = env.apply_visual_shift(
+                    table_center_xyz=table_center_xyz,
+                    darken=darken,
+                    color_light=False,
+                    texture=texture,
+                    texture_dir=texture_dir,
+                    camera_shift=camera_shift,
+                    rng=np.random.RandomState(test_seed),
+                    verbose=False,
+                )
+                # texture reset rebuilds env internals; restore benchmark init state
+                # without calling env.reset() again (which may overwrite patched XML).
+                if visual_info.get("reset_applied", False):
+                    env.set_benchmark_init_without_reset(
+                        init_state_id=test_idx,
+                    )
 
             # add physics randomization here if needed
             if friction_scale != 1.0 or gz_scale != 1.0 or solref_scale != 1.0:
@@ -361,6 +501,26 @@ class LiberoForceSocketEvaluator:
                     tweak_solref_range=possible_solref_range,
                     rng=np.random.RandomState(test_seed),
                 )
+            if use_dynamic_color_light:
+                env.visual_helper.capture_dynamic_light_base(
+                    model=env.env.sim.model,
+                )
+                env.visual_helper.apply_dynamic_rainbow_light(
+                    model=env.env.sim.model,
+                    # step_idx=env.step_cnt,
+                    step_idx=1,
+                )
+                env.env.sim.forward()
+
+            print(
+                "[DEBUG] Visual (ep="
+                f"{test_idx+1}/{self.test_cnt}, seed={test_seed}): "
+                f"darken(vd)={bool(darken)} "
+                f"texture(vt)={bool(texture)} "
+                f"color(vc)={bool(use_dynamic_color_light)} "
+                f"view(vv)={bool(camera_shift)}"
+            )
+            obs = env.regenerate_obs_from_current_state()
 
             env_name = env.task_name
             cur_sr = float(np.array(eval_results['success_list']).mean()) * 100. if len(
@@ -508,6 +668,12 @@ class LiberoForceSocketEvaluator:
                 env_action: np.ndarray = action[0, 0]  # (Da,)
                 # if self.abs_action:
                 #     env_action = self.undo_transform_action(action)
+                if use_dynamic_color_light:
+                    env.visual_helper.apply_dynamic_rainbow_light(
+                        model=env.env.sim.model,
+                        step_idx=env.step_cnt,
+                    )
+                    env.env.sim.forward()
 
                 obs, reward, done, info = env.step(env_action)
 
@@ -537,13 +703,14 @@ class LiberoForceSocketEvaluator:
                 pbar.update(action.shape[1])
             pbar.close()
             vis_force_T_D = np.array(vis_forces)  # (T,6)
-            vis_force_frames, *_ = plot_force_sensor_wrt_time(vis_force_T_D, only_last_frame=True)
-            vis_frames = [concatenate_rgb_images(f, vis_force_frames[-1], resize_ratio=2.) for f in vis_frames]
+            # NOTE: add a setting here
+            # vis_force_frames, *_ = plot_force_sensor_wrt_time(vis_force_T_D, only_last_frame=True)
+            # vis_frames = [concatenate_rgb_images(f, vis_force_frames[-1], resize_ratio=2.) for f in vis_frames]
             if vis_rollout_video:
                 save_frames_as_video(
                     vis_frames,
                     save_path=f"/home/geyuan/code/LIBERO-FT/debug/libero_rollout/"
-                              f"tmp_cosmos_liberoft_eval{test_idx:02d}_suc={success:1d}.mp4"
+                              f"shift={domain_shift_str}_merge_liberoft_eval{test_idx:02d}_suc={success:1d}.mp4"
                 )
             eval_results["success_list"].append(float(success))
             eval_results[f"test/seed{test_seed}_mean_score"] = float(success)
