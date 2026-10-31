@@ -1,0 +1,62 @@
+# Python caches and build metadata
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+/build/
+/dist/
+
+# Local environments and credentials
+.venv/
+venv/
+.conda-env/
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Local datasets and converted recordings (keep source packages named dataset)
+/dataset/
+/data/cache/
+/data/outputs/
+*.h5
+*.hdf5
+*.parquet
+*.zarr/
+
+# Training outputs, model weights, and experiment logs
+outputs/
+checkpoints/
+wandb/
+runs/
+mlruns/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.npz
+*.npy
+*.log
+MUJOCO_LOG.TXT
+events.out.tfevents*
+.hydra/
+
+# Generated training plots
+loss_epoch.png
+val_loss_epoch.png
+loss_steps.png
+loss_summary.png
+full_dataset_mse_steps.png
+
+# Editor, OS, and local agent state
+.DS_Store
+Thumbs.db
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.codex/
+.agents/
+.serena/

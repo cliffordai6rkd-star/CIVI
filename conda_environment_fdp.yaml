@@ -1,0 +1,11 @@
+name: fdp-training
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - ffmpeg=7.1.1
+  - libstdcxx-ng>=14
+  - libgcc-ng>=14
+  - pip:
+      - -r requirements-training.txt

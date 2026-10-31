@@ -1,0 +1,8 @@
+# @package _global_
+# Legacy entry-point name; new runs use the RGB blur curriculum.
+defaults:
+  - /alation_study/train_dp_image_wrench_selfattn_contact_blur_insert_usb
+  - _self_
+
+name: train_dp_image_wrench_selfattn_contact_mask_insert_usb
+

@@ -1,0 +1,120 @@
+name: train_distill_render_net
+_target_: diffusion_policy.workspace.train_distill_render_net_workspace.TrainDistillRenderNetWorkspace
+teacher_checkpoint: ${oc.env:FDP_TEACHER_CHECKPOINT,data/outputs/fdp/checkpoints/latest.ckpt}
+# Optional resource locations when a teacher was trained in another project.
+# Null keeps the paths stored in its checkpoint.
+dino_model_path: ${oc.env:DINOV3_MODEL_PATH,null}
+dataset_path: ${oc.env:DP_DATASET_PATH,null}
+
+# Complete both train/validation caches before any optimizer update.
+# Raw patch percentages are independent of the rendering percentile interval.
+teacher_cache:
+  enabled: true
+  cleanup_on_exit: true # Delete this run's teacher targets on completion, errors and stop signals.
+  dtype: float16 # Token storage/transfer only; attention and token MSE remain float32.
+  directory: data/cache/render_net_teacher
+  batch_size: 8
+  num_workers: 4
+  load_into_ram: false # Read teacher targets from SSD via mmap; keep RGB preloaded in RAM.
+  only: false # To retain a precomputed cache, also set cleanup_on_exit=false.
+
+render_net:
+  architecture_version: 2
+  backbone: transformer # CNN + self/cross-attention + skip decoder; unet omits image self-attention
+  base_channels: 16
+  conv_block: bottleneck # Narrow spatial convolutions and reduce channels before decoder upsampling.
+  initialize_wrench_from_teacher: true
+  conditioning_dim: 256 # Resolved from teacher when initialization is enabled.
+  wrench_history_steps: 8 # Resolved from the teacher, as are observation steps and camera keys.
+  max_obs_steps: 2
+  wrench_layers: 1
+  wrench_dropout: 0.0
+  image_keys: [side, wrist]
+  residual_scale: 0.1
+  transformer:
+    patch_size: 16 # CNN downsampling factor; power of two, >= 2.
+    embed_dim: 128
+    depth: 4
+    num_heads: 4
+    mlp_ratio: 4.0
+    dropout: 0.0
+  high_attention_render:
+    enabled: false
+    # Arbitrary floats: 0 <= lower < upper <= 100. Per camera/observation.
+    percentiles: [80.0, 99.0]
+    # Teacher rollout supervises a student mask head; inference needs no teacher.
+    mask_loss_weight: 1.0
+    teacher_seed: 42
+
+# Inherit the teacher's dataset class, windows and episode train/val split.
+# With val_ratio=0, train on all episodes and save latest without validation/early stopping.
+# Keep RGB identical on teacher and student paths, and use the saved normalizer.
+dataset:
+  video_backend: null
+  video_decode_device: cuda:0
+  preload_images: true
+  image_randomer_config: null
+  # preload_wrench: true
+  load_result_add: ram
+  image_cache_dtype: uint8
+
+dataloader:
+  batch_size: 32
+  num_workers: 4
+  shuffle: true
+  pin_memory: true
+  persistent_workers: true
+
+val_dataloader:
+  batch_size: 64
+  shuffle: false
+  pin_memory: true
+  persistent_workers: true
+
+optimizer:
+  lr: 0.0003
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+
+logging:
+  progress_bar: true # tqdm for decoding/teacher caching, training and validation
+  tqdm_interval_sec: 1.0
+  plot_every_steps: 100 # also save after initial validation and each epoch; 0 = epoch only
+
+training:
+  seed: 42
+  device: cuda:0
+  resume_from: null # Restore a single-GPU or DDP checkpoint, including optimizer and epoch.
+  distributed:
+    enabled: false # Launch with torchrun and set true; one complete model replica per GPU.
+    backend: nccl
+    batch_size_is_global: true # Four GPUs split batch_size=32 into 8 samples each.
+    find_unused_parameters: false
+    timeout_seconds: 86400 # Rank 0 may need hours to prepare teacher targets before training.
+  num_epochs: 1000
+  # Optional step cap for smoke tests; normal training is limited by epochs.
+  max_steps: null
+  max_grad_norm: 1.0
+  log_every: 10
+  # Validate the entire validation split after every epoch.
+  max_val_batches: null
+  early_stopping:
+    enabled: true
+    patience: 30
+    min_delta: 0.0
+  amp:
+    enabled: true
+    dtype: bfloat16
+    allow_tf32: true
+  compile:
+    enabled: true # CUDA training only; validation/cache generation use eager execution.
+    render_backbone: true # Keep the complete LSTM sequence outside compilation.
+    student_dino: true # Preserve gradients from frozen DINO back to rendered RGB.
+    backend: inductor
+    mode: default # First training batch compiles; a new batch/image shape may recompile.
+
+hydra:
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_distill_render_net
+  job:
+    chdir: false

@@ -1,0 +1,48 @@
+# Every relative path below is relative to project_root, not the launcher's cwd.
+project_root: ../..
+
+dp:
+  repo: ../dp_hirol_main
+  checkpoint: ../dp_hirol_main/data/outputs/2026.10.31/14.44.46_sim_force_aware_dp_train_20hz_lstm2_libero_open_top_drawer_put_bowl_20hz_force_aware/checkpoints/optimizer_step=00060000.ckpt
+  backbone: ../dp_hirol_main/model/model/dinov3-vitb16-pretrain-lvd1689m
+  state_key: ema_model
+  diffusion_steps: null # Restore the checkpoint's DDIM inference steps (8).
+
+cad_wm:
+  repo: cad-wm
+  train_config: cad-wm/config/bench_train_config/libero_drawer_wrench_h5.yaml
+  checkpoint: null # Fill in the trained CAD-WM .pt path; required for inference.
+  device: null # Same as runtime.device unless overridden.
+  steps: null # Restore flow integration settings from the CAD-WM checkpoint.
+  solver: null
+
+runtime:
+  device: cuda:0
+  seed: 42
+  amp_enabled: true # DP only; CAD-WM follows WrenchPredictor's float32 path.
+  amp_dtype: bfloat16
+  timing_tolerance_s: 0.001
+  # cad_wm: previous forecast's first token estimates current phase wrench.
+  # measured: current measured wrench is used only for phase history.
+  # Future network wrench always comes from CAD-WM in either mode.
+  phase_wrench_source: cad_wm
+
+# Optional offline replay: uses only images and histories ending at each row.
+# It emits pose predictions; it does not step a simulator or execute a robot.
+replay:
+  dataset: dataset/wm_data/KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet_and_put_the_bowl_in_it_demo_wrench_with_dq_tau.hdf5
+  demo: demo_0
+  start_frame: 0
+  max_frames: 100
+  predict_every: 1
+  output: outputs/inference/fdp_cad_wm_demo_0.npz
+  fields:
+    timestamp: states # First column, seconds.
+    q: obs/joint_states
+    dq: obs/dq
+    tau: obs/tau
+    joint_columns: [0, 1, 2, 3, 4, 5, 6]
+    cameras:
+      wrist: obs/eye_in_hand_rgb
+      side: obs/agentview_rgb
+    wrench: obs/wrenches # Read ONLY for phase_wrench_source: measured.

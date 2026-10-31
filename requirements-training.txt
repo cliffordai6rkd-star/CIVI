@@ -1,0 +1,33 @@
+# FDP / RenderNet training (Python 3.10, Linux, CUDA 12.8).
+# Use this in a training environment; requirements.txt is the legacy simulator environment.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.7.1+cu128
+torchvision==0.22.1+cu128
+torchcodec==0.5+cu128
+nvidia-npp-cu12==12.4.1.87; platform_system == "Linux"
+numpy>=2.2,<2.3
+scipy>=1.10,<1.16
+pandas>=2.2,<3
+h5py>=3.11
+pyarrow>=20,<21
+opencv-python-headless>=4.9,<4.12
+Pillow>=11,<13
+PyYAML>=6
+hydra-core>=1.3,<1.4
+omegaconf>=2.3,<2.4
+diffusers>=0.35,<0.36
+transformers>=4.56,<5
+huggingface-hub>=0.35,<0.36
+lerobot==0.4.0
+accelerate>=1.10,<2
+einops>=0.8,<0.9
+zarr>=2.18,<3
+numcodecs>=0.13,<0.14
+numba>=0.66,<0.67
+filelock>=3.16,<4
+psutil>=5.9
+matplotlib>=3.7
+tqdm>=4.67,<5
+wandb>=0.20,<0.22
+dill>=0.3.8,<0.4
+pytest>=7,<9

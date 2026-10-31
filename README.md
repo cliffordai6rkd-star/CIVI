@@ -27,6 +27,27 @@ varying physical conditions, enabling thorough analysis before deploying force-b
 - **A training&testing example**: Demonstrates training and testing of a diffusion policy with added force-torque inputs, evaluating performance under various domain shifts after in-domain training.
 
 
+## FDP + RenderNet training
+
+FDP 与 RenderNet 蒸馏训练入口、配置及依赖已包含在本项目中，使用方法见
+[`TRAINING.md`](TRAINING.md)。统一入口为 `train_pipeline.py`，训练环境依赖为
+`requirements-training.txt`，支持单卡、多卡及两阶段自动训练。
+
+## FDP + CAD-WM inference
+
+统一推理接口为 [`InferenceBase`](inference/inference_base.py)，当前实现为 [`FDPInference`](inference/fdp_inference.py)。后续 DP、pi0、pi0.5 可分别继承父类，复用观测、episode reset 和动作返回接口。FDP 逐帧接收图像与 q/dq/tau，未来 wrench 来自 CAD-WM。
+
+模型、数据、输出路径集中在 [`configs/inference/fdp_cad_wm.yaml`](configs/inference/fdp_cad_wm.yaml)。默认 DP 指向本次 6 万步权重；CAD-WM 尚未训练，先保留 `cad_wm.checkpoint: null`，训练后填入 `.pt` 路径。
+
+```bash
+conda activate fdp
+python run_inference.py --config configs/inference/fdp_cad_wm.yaml --check-config
+# 填好 CAD-WM 权重后，回放传感器输入并保存位姿预测：
+python run_inference.py --config configs/inference/fdp_cad_wm.yaml
+```
+
+入口输出绝对末端位姿 xyz+xyzw（不含夹爪），默认不读取真实 wrench，也不执行仿真器或机器人动作。时间对齐、在线调用和测试说明见 [inference/README.md](inference/README.md)。
+
 ## 🛠️ Installation
 
 `LIBERO-FT` shares most of its environment with the original [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO?tab=readme-ov-file#installtion), with only a few additional dependencies required for debugging and training purposes. To get started, follow these steps:
@@ -40,9 +61,44 @@ cd LIBERO-FT
 pip install -r requirements.txt
 pip install torch==1.11.0+cu113 torchvision==0.12.0+cu113 torchaudio==0.11.0 --extra-index-url https://download.pytorch.org/whl/cu113
 
-# Install additional dependencies
-pip install git+https://github.com/ygtxr1997/RoboKit.git@6066dbb
+# Optional: only needed by the force benchmark / debug notebooks.
+# The q/dq/tau replay script does not import RoboKit.
+# conda install -c conda-forge cmake -y
+# pip install git+https://github.com/ygtxr1997/RoboKit.git@6066dbb
 ```
+
+For the q/dq/tau replay script, Python 3.10 is a practical choice for the
+listed package versions. A non-interactive local setup is:
+
+```shell
+conda create -n libero_ft python=3.10 -y
+conda activate libero_ft
+cd /path/to/LIBERO-FT
+pip install -r requirements.txt
+pip install -e .
+# Optional for the force benchmark / debug notebooks. Its egl_probe extension
+# needs CMake; install it first if you need RoboKit:
+# conda install -c conda-forge cmake -y
+# pip install git+https://github.com/ygtxr1997/RoboKit.git@6066dbb
+
+# Keep LIBERO's paths inside the checkout; this avoids the first-import prompt.
+export LIBERO_CONFIG_PATH="$PWD/.libero"
+mkdir -p "$LIBERO_CONFIG_PATH"
+cat > "$LIBERO_CONFIG_PATH/config.yaml" <<EOF
+benchmark_root: $PWD/libero/libero
+bddl_files: $PWD/libero/libero/bddl_files
+init_states: $PWD/libero/libero/init_files
+datasets: $PWD/dataset
+assets: $PWD/libero/libero/assets
+EOF
+
+# On a headless machine, MuJoCo offscreen rendering may need:
+export MUJOCO_GL=egl
+```
+
+The replay script creates the LIBERO config automatically if it does not
+exist, but setting `LIBERO_CONFIG_PATH` explicitly makes the dataset and asset
+locations reproducible.
 
 
 ## 💽 Datasets
@@ -60,6 +116,123 @@ We provide a class `libero.force.hdf5_replayer.HDF5Replayer` to replay LIBERO tr
 `HDF5Replayer` can construct the full environment according to the meta info saved in LIBERO HDF5 files, replay actions frame-by-frame, and consequently check if the replayed trajectory succeds or not.
 
 A usage example for `HDF5Replayer` is available at: [notebooks/force_hdf5_replayer.ipynb](./notebooks/force_hdf5_replayer.ipynb).
+
+#### Replay q and save dq / tau
+
+For position-only replay, use [`scripts/replay_q_mujoco.py`](./scripts/replay_q_mujoco.py). It reads `obs/joint_states` by default, restores the BDDL scene from the HDF5 metadata, copies the original HDF5, and adds exactly two datasets: `data/<demo>/obs/dq` and `data/<demo>/obs/tau`.
+
+```shell
+python scripts/replay_q_mujoco.py \
+  --dataset /path/to/task_demo.hdf5 \
+  --demo demo_0
+```
+
+For example, to process demos 10 through 19 (inclusive) from a task and put
+the copied dataset with the two new fields under `dataset/wm_data/`:
+
+```shell
+python scripts/replay_q_mujoco.py \
+  --dataset dataset/libero_90/KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet_and_put_the_bowl_in_it_demo_wrench.hdf5 \
+  --demo-range 10 19 \
+  --overwrite
+```
+
+The default output is
+`dataset/wm_data/<input-name>_with_dq_tau.hdf5`. All original demos and
+datasets are preserved; only the selected demos receive
+`data/demo_x/obs/dq` and `data/demo_x/obs/tau`. Use `--wm-data-dir` to choose a
+different output directory or `--output` to choose the complete output path.
+If the output already exists, add `--overwrite` to replace it.
+The range endpoints are inclusive. Use `--demo all` for every demonstration or
+`--q-key qpos` for another HDF5 key. The default torque is
+`data.qfrc_inverse`, which is defined for a q trajectory.
+`--tau-source actuator --ctrl-key ctrl` records actuator torque when the
+dataset also contains MuJoCo controls. Visualization is disabled by default;
+`--video` or `--plot` enables it explicitly. `--xml /path/to/model.xml` can be
+used for standalone NPZ/NPY input.
+
+The original LIBERO-FT `obs/wrenches` values are MuJoCo sensor readings, not
+measurements affected by video playback speed. The official
+[`HDF5Replayer`](./libero/force/hdf5_replayer.py) replays one action per
+environment control tick (the example datasets use `control_freq=20`) and
+reads `gripper0_force_ee` and `gripper0_torque_ee` from
+`sim.data.sensordata`. The q replay script preserves an existing
+`obs/wrenches` dataset; it does not regenerate it. Regenerating wrench values
+requires the same q/qvel/qacc timeline, model, contacts, and control period.
+
+#### Rerun visualization
+
+Install the Rerun SDK from the active environment:
+
+```shell
+python -m pip install rerun-sdk
+```
+
+Then visualize two camera streams and the six wrench channels (`Fx`, `Fy`,
+`Fz`, `Mx`, `My`, `Mz`):
+
+```shell
+python scripts/visualize_hdf5_rerun.py \
+  --dataset dataset/libero_90/KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet_and_put_the_bowl_in_it_demo_wrench.hdf5 \
+  --demo 0
+```
+
+The script reads `obs/agentview_rgb`, `obs/eye_in_hand_rgb`, and
+`obs/wrenches`. It uses the HDF5 `env_args.env_kwargs.control_freq` for the
+Rerun time axis; the example dataset is 20 Hz (`dt=0.05 s`). The default mode
+logs the complete demo as quickly as possible so it can be scrubbed in Rerun.
+Use `--realtime` for wall-clock playback, `--speed 2` for twice-speed playback,
+or save a portable recording without opening a viewer:
+
+```shell
+python scripts/visualize_hdf5_rerun.py \
+  --dataset dataset/libero_90/KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet_and_put_the_bowl_in_it_demo_wrench.hdf5 \
+  --demo 0 --save /tmp/libero_demo_0.rrd --no-spawn
+rerun --open /tmp/libero_demo_0.rrd
+```
+
+Use `--demo all` or `--demo-range 0 55` to log multiple demos. If the camera
+image orientation is already correct in your file, add `--no-flip-vertical`.
+
+To inspect the actual MuJoCo scene interactively while the q trajectory is
+being replayed, add `--viewer`:
+
+```shell
+python scripts/replay_q_mujoco.py \
+  --dataset dataset/libero_90/KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet_and_put_the_bowl_in_it_demo_wrench.hdf5 \
+  --demo 0 \
+  --q-key states \
+  --q-format state \
+  --viewer \
+  --overwrite \
+  --viewer-hold
+```
+
+The viewer uses real-time playback by default. Change only the wall-clock
+display speed with `--viewer-speed 2`; this does not change the q sample period,
+`dq`, `tau`, or any sensor value. Without `--viewer`, the calculation is
+offline and runs as fast as the machine allows. Add `--realtime` if a headless
+run must wait one q period between samples. Close the viewer to stop a range
+replay; the currently unfinished demo is skipped, while completed demos remain
+in the output HDF5.
+Collision geometry is hidden in the viewer by default. The green/blue arm
+shapes in the MuJoCo viewer are debug collision geoms, not the robot visual
+mesh; use `--show-collision` only when you need to inspect contacts. Hiding
+them changes only viewer visibility, not collision detection or torque
+calculation.
+Using `--q-key states --q-format state` replays the complete MuJoCo state,
+including object poses, so it is the recommended mode for checking whether a
+task scene follows the demonstration. The state parser handles robosuite's
+`[time, qpos, qvel, ...]` layout; the leading time value is not treated as a
+joint coordinate. The default `obs/joint_states` mode replays the robot joint
+positions while keeping non-robot state at its initial value.
+For HDF5 input, the script reconstructs the scene from BDDL by default, which
+uses the installed LIBERO and robosuite assets consistently. The stored
+`model_file` can be selected with `--scene-source dataset` when its asset paths
+are available and you need to reproduce that exact XML.
+The viewer requires a graphical display. On a remote machine, use X11
+forwarding or a desktop session; `MUJOCO_GL=egl` is suitable for offscreen
+rendering but does not create a GUI window.
 
 Below are the visualization examples of 2x speedup replayed trajectories (left to right are: original observation saved in LIBERO HDF5, online observation during replay, 6D force-torque sensory data):
 
