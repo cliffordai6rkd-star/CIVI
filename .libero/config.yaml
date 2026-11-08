@@ -1,0 +1,5 @@
+benchmark_root: /home/lcy/code/LIBERO-FT/libero/libero
+bddl_files: /home/lcy/code/LIBERO-FT/libero/libero/bddl_files
+init_states: /home/lcy/code/LIBERO-FT/libero/libero/init_files
+datasets: /home/lcy/code/LIBERO-FT/dataset
+assets: /home/lcy/code/LIBERO-FT/libero/libero/assets

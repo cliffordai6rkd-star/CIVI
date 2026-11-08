@@ -52,9 +52,11 @@ read directly without timestamp interpolation or resampling. By default,
 Set it to true to enable the configured 90/10 demo split. `--no-val` overrides
 validation settings on the command line.
 
-Contact labels use raw force XYZ L2 norm with DP's thresholds: 8 N for entry
-and exit, five consecutive frames, strict comparisons and no backfill. The
-one second preceding the first confirmed contact is pre-contact. Training
+Contact labels use raw force XYZ L2 norm with thresholds of 8 N for entry
+and exit and five consecutive frames. Strict >8 enters and strict <8 exits;
+equality holds the state and resets the streak. Offline labels backfill each
+confirmed entry/exit window to its first frame. The one second preceding the
+first backfilled contact onset is pre-contact. Training
 windows are sampled with free/pre-contact/contact weights 1/5/5, using the
 maximum existing phase in the future window. Validation is not oversampled.
 Importance correction is disabled by default to emphasize pre-contact and

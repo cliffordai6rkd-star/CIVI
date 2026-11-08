@@ -30,7 +30,15 @@ def load_dp(config, device):
         raise RuntimeError("A different diffusion_policy package was already imported; use a fresh process")
     OmegaConf.register_new_resolver("eval", eval, replace=True)
     checkpoint = Path(config["checkpoint"])
-    payload = torch.load(checkpoint, map_location="cpu", pickle_module=dill)
+    # The DP checkpoint contains the resolved config and optimizer-era Python
+    # objects in addition to tensors.  PyTorch 2.6 changed the implicit
+    # default to ``weights_only=True``; opt out explicitly for this trusted
+    # project checkpoint and keep compatibility with older torch releases.
+    try:
+        payload = torch.load(checkpoint, map_location="cpu", pickle_module=dill,
+                             weights_only=False)
+    except TypeError:  # torch versions before the weights_only argument
+        payload = torch.load(checkpoint, map_location="cpu", pickle_module=dill)
     cfg = payload["cfg"]
     if not OmegaConf.is_config(cfg):
         cfg = OmegaConf.create(cfg)
@@ -76,19 +84,27 @@ def _image(value, shape, name):
 
 
 class FDPInference(InferenceBase):
-    """Emit absolute xyz+xyzw pose chunks, not OSC deltas or gripper commands.
+    """Emit absolute xyz+xyzw chunks, with a gripper command for 8D policies.
 
-    Default phase source is also CAD-WM: its previous t+1 forecast is the
-    current phase wrench. No ground-truth wrench is read. The first anchor
-    has no causal estimate, so wait for two phase-ready camera observations.
-    With padded CAD-WM histories this takes three observe() calls. An optional
-    measured phase source uses the current sensor wrench instead; future
-    network inputs ALWAYS come from CAD-WM in either mode.
+    The phase source is selected by the runtime config. With ``cad_wm`` the
+    previous t+1 forecast is the current phase wrench; with ``measured`` the
+    current sensor wrench drives the phase history. Future network inputs always
+    come from CAD-WM. The padded WM history makes a future forecast available on
+    the first frame; image context still needs two observations before action.
     """
 
     @classmethod
     def from_config(cls, path):
         config = load_config(path)
+        return cls.from_loaded_config(config)
+
+    @classmethod
+    def from_loaded_config(cls, config):
+        """Build an engine from an already resolved config mapping.
+
+        The HTTP FDP service uses this hook to override the teacher checkpoint
+        from the command line without writing a temporary YAML file.
+        """
         runtime = config["runtime"]
         device = torch.device(runtime["device"])
         # Fail on the missing WM path before allocating a large DP policy.
@@ -100,14 +116,17 @@ class FDPInference(InferenceBase):
         policy, dp_config, state_key = load_dp(config["dp"], device)
         instance = cls(policy=policy, dp_config=dp_config, wrench_provider=wm,
                        device=device, phase_wrench_source=runtime["phase_wrench_source"],
+                       future_contact_mode=runtime.get("future_contact_mode"),
                        seed=runtime["seed"], timing_tolerance_s=runtime["timing_tolerance_s"],
                        amp_enabled=runtime["amp_enabled"], amp_dtype=runtime["amp_dtype"])
         instance.checkpoint_info = {"dp": config["dp"]["checkpoint"], "dp_state_key": state_key,
-                                    "cad_wm": config["cad_wm"]["checkpoint"]}
+                                    "cad_wm": config["cad_wm"]["checkpoint"],
+                                    "future_contact_mode": instance.future_contact_mode}
         return instance
 
     def __init__(self, *, policy, dp_config, wrench_provider, device="cpu", seed=42,
                  phase_wrench_source="cad_wm", timing_tolerance_s=0.001,
+                 future_contact_mode=None,
                  amp_enabled=True, amp_dtype="bfloat16"):
         self.device = torch.device(device)
         self.policy = policy.to(self.device).eval().requires_grad_(False)
@@ -116,14 +135,33 @@ class FDPInference(InferenceBase):
         self.phase_wrench_source = phase_wrench_source
         if phase_wrench_source not in {"cad_wm", "measured"}:
             raise ValueError("phase_wrench_source must be cad_wm or measured")
+        checkpoint_contact_mode = str(getattr(policy, "future_contact_mode", "legacy_rollout"))
+        contact_mode = checkpoint_contact_mode if future_contact_mode is None else str(future_contact_mode)
+        if contact_mode not in {"legacy_rollout", "token_threshold"}:
+            raise ValueError(
+                "future_contact_mode must be legacy_rollout or token_threshold"
+            )
+        # The teacher checkpoint owns the default preprocessing contract.  A
+        # runtime override is explicit because a stochastic CAD-WM forecast
+        # can otherwise toggle token_threshold at the contact boundary every
+        # frame.  This does not alter diffusion sampling or action noise.
+        self.future_contact_mode = contact_mode
+        if hasattr(self.policy, "future_contact_mode"):
+            self.policy.future_contact_mode = contact_mode
         self.timing_tolerance_s = float(timing_tolerance_s)
         self.dt = float(dp_config.task.dataset.timestamp_step_sec)
         if not np.isfinite(self.dt) or self.dt <= 0:
             raise ValueError("DP timestamp_step_sec must be positive")
         if not np.isfinite(self.timing_tolerance_s) or not 0 <= self.timing_tolerance_s < self.dt / 2:
             raise ValueError("timing_tolerance_s must be finite, nonnegative and below half a frame")
-        if bool(dp_config.policy.relative_pose_actions) or list(dp_config.task.dataset.action_feature_fields) != ["observation.ee_pose"]:
-            raise ValueError("This FDP adapter expects absolute observation.ee_pose targets (xyz+xyzw)")
+        self.action_dim = int(dp_config.shape_meta.action.shape[0])
+        fields = list(dp_config.task.dataset.action_feature_fields)
+        columns = dp_config.task.dataset.get("action_feature_columns", {})
+        pose_target = self.action_dim == 7 and fields == ["observation.ee_pose"]
+        gripper_target = (self.action_dim == 8 and fields == ["observation.ee_pose", "action"]
+                          and list(columns.get("action", [])) == [6])
+        if bool(dp_config.policy.relative_pose_actions) or not (pose_target or gripper_target):
+            raise ValueError("This FDP adapter expects absolute observation.ee_pose, optionally followed by action column 6 (gripper)")
         self.wrench_key = str(policy.wrench_key)
         self.phase_key = str(policy.phase_wrench_key)
         if self.wrench_key == self.phase_key:
@@ -148,11 +186,19 @@ class FDPInference(InferenceBase):
             raise ValueError("CAD-WM and FDP sample rates / future wrench timestamps do not match")
         self.future_offsets_s = offsets
         self.observation_steps = int(policy.n_obs_steps)
-        if tuple(shape_meta.action.shape) != (7,):
-            raise ValueError("FDP pose output must have seven components: xyz+xyzw")
+        if tuple(shape_meta.action.shape) != (self.action_dim,) or self.action_dim not in (7, 8):
+            raise ValueError("FDP output must be xyz+xyzw, optionally followed by a gripper command")
         # This checkpoint's returned indices start at the current anchor, t,
         # because action_start_index == n_obs_steps-1. Preserve that convention.
         latency = int(dp_config.task.dataset.get("n_latency_steps", 0))
+        if latency < 0:
+            raise ValueError("n_latency_steps must be nonnegative")
+        first_action_offset = int(policy.action_start_index) + latency - (self.observation_steps - 1)
+        if first_action_offset < 0:
+            raise ValueError(
+                "FDP action chunk starts before the latest observation; "
+                "check action_start_index, n_obs_steps and n_latency_steps"
+            )
         self.action_offsets_s = (np.arange(policy.n_action_steps) + policy.action_start_index
                                  - (self.observation_steps - 1) + latency) * self.dt
         self.amp_enabled = bool(amp_enabled) and self.device.type == "cuda"
@@ -167,8 +213,9 @@ class FDPInference(InferenceBase):
         required = ("images", "q", "dq", "tau")
         if self.phase_wrench_source == "measured":
             required += ("wrench",)
+        action_format = "absolute_ee_pose_xyz_xyzw" + ("_gripper_command" if self.action_dim == 8 else "")
         return InferenceSpec(1 / self.dt, self.observation_steps, self.image_shapes,
-                             (int(self.policy.n_action_steps), 7), "absolute_ee_pose_xyz_xyzw", required)
+                             (int(self.policy.n_action_steps), self.action_dim), action_format, required)
 
     def reset(self, *, seed=None):
         if seed is not None:
@@ -243,6 +290,7 @@ class FDPInference(InferenceBase):
         if self._last_timestamp is None:
             raise RuntimeError("Call observe() or pass an observation before predicting")
         info = {"wrench_source": "cad_wm", "phase_wrench_source": self.phase_wrench_source,
+                "future_contact_mode": self.future_contact_mode,
                 "frames_seen": self._frames_seen, "warmup_reason": self._warmup_reason,
                 "future_wrench": None if self._latest_future is None else self._latest_future.copy(),
                 "future_wrench_offsets_s": self.future_offsets_s.copy(), **self.checkpoint_info}
@@ -254,7 +302,7 @@ class FDPInference(InferenceBase):
         actions = result["action"][0].detach().float().cpu().numpy().copy()
         if actions.shape != self.spec.action_shape or not np.isfinite(actions).all():
             raise RuntimeError("FDP returned an invalid action chunk")
-        norms = np.linalg.norm(actions[:, 3:], axis=-1)
+        norms = np.linalg.norm(actions[:, 3:7], axis=-1)
         if not np.allclose(norms, 1, atol=1e-3, rtol=0):
             raise RuntimeError("FDP returned a non-unit xyzw quaternion")
         info["context_timestamps_s"] = np.array([row["timestamp"] for row in self._contexts])

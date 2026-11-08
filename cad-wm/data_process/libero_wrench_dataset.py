@@ -36,10 +36,11 @@ def prediction_offsets(config):
 
 
 def wrench_phase_labels(wrench, config, fps):
-    """DP's strict-threshold debounce; precontact precedes the first onset.
+    """Offline strict-threshold debounce; precontact precedes the first onset.
 
-    Equality retains state and resets both streaks. Confirmation is causal
-    without backfill. Call independently per demo to reset contact state.
+    Confirmed entry/exit windows are backfilled to their first frame. Equality
+    retains state and resets both streaks. Call independently per demo to reset
+    contact state; these offline targets require the full confirmation window.
     """
     values = config["contact_gate"]
     if values.get("metric") != "force_xyz_l2" or values.get("label_mode") != "three_phase":
@@ -58,8 +59,10 @@ def wrench_phase_labels(wrench, config, fps):
         below = below + 1 if value < free else 0
         if not state and above >= enter:
             state, above = True, 0
+            labels[index - enter + 1:index + 1] = 2
         elif state and below >= leave:
             state, below = False, 0
+            labels[index - leave + 1:index + 1] = 0
         labels[index] = 2 if state else 0
     onsets = torch.nonzero(labels == 2).flatten()
     if len(onsets):

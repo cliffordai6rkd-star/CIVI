@@ -1,0 +1,51 @@
+# Offline comparison: teacher FDP on raw RGB versus the same frozen FDP on
+# RenderNet RGB. Relative paths resolve from project_root below.
+project_root: ../..
+
+dp:
+  repo: ../dp_hirol_main
+  checkpoint: ../dp_hirol_main/data/outputs/2026.11.01/22.57.02_091072_dp_distill_pipeline/teacher/checkpoints/optimizer_step=00200000.ckpt
+  backbone: ../dp_hirol_main/model/model/dinov3-vitb16-pretrain-lvd1689m
+  state_key: auto
+  diffusion_steps: null
+
+cad_wm:
+  repo: cad-wm
+  train_config: cad-wm/config/bench_train_config/libero_drawer_wrench_h5_median3.yaml
+  checkpoint: cad-wm/outputs/cad_wm_median3_200k/checkpoints/step_00200000.pt
+  device: null
+  steps: null
+  solver: null
+
+student:
+  repo: ../dp_hirol_main
+  checkpoint: ../dp_hirol_main/data/outputs/2026.11.02/19.55.45_render_net_context_p90_ablation/unrestricted/checkpoints/best.ckpt
+  # For the context_p90 run, change checkpoint to context_p90/checkpoints/best.ckpt
+  # and set this to true.
+  use_attention_mask: false
+
+runtime:
+  device: cuda:0
+  seed: 42
+  amp_enabled: true
+  amp_dtype: bfloat16
+  timing_tolerance_s: 0.001
+  phase_wrench_source: cad_wm
+
+replay:
+  dataset: dataset/wm_data/KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet_and_put_the_bowl_in_it_demo_wrench_with_dq_tau_median3.hdf5
+  demo: demo_0
+  start_frame: 0
+  max_frames: 100
+  predict_every: 1
+  output: outputs/inference/teacher_student_unrestricted_demo_0.npz
+  fields:
+    timestamp: states
+    q: obs/joint_states
+    dq: obs/dq
+    tau: obs/tau
+    joint_columns: [0, 1, 2, 3, 4, 5, 6]
+    cameras:
+      wrist: obs/eye_in_hand_rgb
+      side: obs/agentview_rgb
+    wrench: obs/wrenches

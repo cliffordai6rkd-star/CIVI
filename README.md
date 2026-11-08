@@ -37,16 +37,16 @@ FDP 与 RenderNet 蒸馏训练入口、配置及依赖已包含在本项目中�
 
 统一推理接口为 [`InferenceBase`](inference/inference_base.py)，当前实现为 [`FDPInference`](inference/fdp_inference.py)。后续 DP、pi0、pi0.5 可分别继承父类，复用观测、episode reset 和动作返回接口。FDP 逐帧接收图像与 q/dq/tau，未来 wrench 来自 CAD-WM。
 
-模型、数据、输出路径集中在 [`configs/inference/fdp_cad_wm.yaml`](configs/inference/fdp_cad_wm.yaml)。默认 DP 指向本次 6 万步权重；CAD-WM 尚未训练，先保留 `cad_wm.checkpoint: null`，训练后填入 `.pt` 路径。
+模型、数据、输出路径集中在 [`configs/inference/fdp_cad_wm.yaml`](configs/inference/fdp_cad_wm.yaml)。默认使用 2026-11-05 蒸馏流水线的 18 万步教师 EMA 权重，以及与 DP 原始 wrench 数据同源的 `cad-wm/outputs/cad_wm_median3_200k/checkpoints/step_00180000.pt`，可直接回放世界模型 → 教师的推理链路。默认在线门控使用实测 phase wrench 和迟滞接触状态。
 
 ```bash
 conda activate fdp
 python run_inference.py --config configs/inference/fdp_cad_wm.yaml --check-config
-# 填好 CAD-WM 权重后，回放传感器输入并保存位姿预测：
+# 回放传感器输入并保存位姿预测：
 python run_inference.py --config configs/inference/fdp_cad_wm.yaml
 ```
 
-入口输出绝对末端位姿 xyz+xyzw（不含夹爪），默认不读取真实 wrench，也不执行仿真器或机器人动作。时间对齐、在线调用和测试说明见 [inference/README.md](inference/README.md)。
+入口输出绝对末端位姿 xyz+xyzw 及夹爪命令，默认读取当前实测 wrench 只驱动接触迟滞门控，也不执行仿真器或机器人动作。时间对齐、在线调用和测试说明见 [inference/README.md](inference/README.md)。
 
 ## 🛠️ Installation
 
@@ -193,6 +193,30 @@ rerun --open /tmp/libero_demo_0.rrd
 
 Use `--demo all` or `--demo-range 0 55` to log multiple demos. If the camera
 image orientation is already correct in your file, add `--no-flip-vertical`.
+
+For a MuJoCo scene window controlled by a separate wrench-plot cursor, run:
+
+```shell
+python scripts/replay_wrench_mujoco.py \
+  --dataset dataset/wm_data/KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet_and_put_the_bowl_in_it_demo_wrench_with_dq_tau.hdf5 \
+  --demo 0
+```
+
+This entry replays the recorded `states` (robot and object poses) and displays
+`obs/wrenches` as force XYZ in N and torque XYZ in N.m. The plot shows the full
+episode with a time cursor and current-value markers. It starts at the first
+frame and never advances automatically. Drag the bottom time slider or
+click/drag either curve panel to select a time; the MuJoCo state and all plot
+markers update to the same nearest recorded frame. The time axis comes from
+`env_args.env_kwargs.control_freq` (20 Hz for this dataset). The dataset is
+opened read-only.
+
+Left/Right steps through frames, R/Home selects the first frame, End selects
+the last frame, N/P changes episodes, and Q/Esc closes both windows. Use
+`--demo-range 0 4` to select multiple episodes. Closing either window stops
+inspection. `--headless` validates state replay without opening either window.
+The default plot backend is TkAgg; `--plot-backend QtAgg` selects an installed
+Qt backend. This script requires a desktop display for interactive playback.
 
 To inspect the actual MuJoCo scene interactively while the q trajectory is
 being replayed, add `--viewer`:
@@ -363,6 +387,36 @@ This approach is reasonable, ensuring the resulting evaluation data is meaningfu
 #### Socket-based evaluation
 
 Since the python environments for model training and simulator evaluating are usually inconsistent, we also provide a socket-based evaluator (based on [Uvicorn](https://uvicorn.dev/)) named `libero.force.force_benchmark.LiberoForceSocketEvaluator`. A usage example is available at [eval_socket.py](./eval_socket.py).
+
+To inspect the measured wrench while a socket rollout is running, add
+`--wrench-plot`. This opens a separate Matplotlib window with the six measured
+force/torque channels and a rolling 20-second history at the default 20 Hz
+control rate. During FDP evaluation it overlays the current eight-point
+CAD-WM future wrench forecast as dashed curves. The forecast is the same
+prediction consumed by DP and does not change the policy request or action
+loop. For example:
+
+```bash
+conda activate libero_ft
+MUJOCO_GL=egl python eval_socket.py \
+  --interface fdp --start-fdp-server \
+  --checkpoint ../dp_hirol_main/data/outputs/2026.11.05/22.45.54_375874_dp_distill_pipeline/teacher/checkpoints/optimizer_step=00180000.ckpt \
+  --wm-checkpoint cad-wm/outputs/cad_wm_median3_200k/checkpoints/step_00180000.pt \
+  --fdp-config configs/inference/fdp_cad_wm.yaml --port 7075 \
+  --task_id k1_open_top_put_bowl \
+  --test-cnt 1 --no-interactive --wrench-plot \
+  -o outputs/fdp_eval
+```
+
+This single command starts the FDP/CAD-WM service, runs the MuJoCo evaluator,
+and overlays the measured wrench with the current eight-point CAD-WM forecast
+in the same live window. Use `--viewer --wrench-plot` to show the MuJoCo viewer
+and wrench curves at the same time. `--wrench-plot-backend` selects another
+Matplotlib GUI backend when needed (for example, `QtAgg`). Closing the curve
+window only stops plotting; the simulator rollout continues. If the FDP server
+is already running, omit `--start-fdp-server`; otherwise `--port` must be free.
+The evaluator now fails immediately when that port is occupied, so it cannot
+silently continue with an older FDP process and older checkpoints.
 
 
 ## 🏆 Benchmark Results

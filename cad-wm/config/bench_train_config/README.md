@@ -105,11 +105,13 @@ noise per anchor and reports physical errors from integrated predictions.
 
 ## Contact phases and strengthened sampling
 
-Labels use raw sqrt(Fx²+Fy²+Fz²), with DP thresholds of 8 N for entry and exit.
+Labels use raw sqrt(Fx²+Fy²+Fz²), with thresholds of 8 N for entry and exit.
 Five consecutive native frames confirm a transition. Strict >8 enters,
-strict <8 exits, equality retains state and breaks the streak, and confirmation
-is not backfilled. Each demo starts free. Free rows in the one second before
-its first confirmed contact become pre-contact: 0=free, 1=pre-contact, 2=contact.
+strict <8 exits, and equality retains state and breaks the streak. Offline
+labels backfill both transitions to the first frame of their confirmation
+window: all five entry frames become contact, and all five exit frames become
+free. Each demo starts free. Free rows in the one second before its first
+backfilled contact onset become pre-contact: 0=free, 1=pre-contact, 2=contact.
 
 Each training window takes the maximum phase in its future eight rows. The
 replacement sampler weights are 1/5/5 for free/pre-contact/contact, using

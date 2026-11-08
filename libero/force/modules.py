@@ -128,11 +128,10 @@ class WrenchObsWrapper:
         Helper for state-replay.
         """
         sim = self.env.env.sim
-        ## 1. Naively set flattened state
-        # sim.set_state_from_flattened(flat_state)
-        # mujoco.mj_forward(sim.model._model, sim.data._data)
-        ## 2. step1 + step2 to ensure sensors updated
         sim.set_state_from_flattened(flat_state)
-        mujoco.mj_step1(sim.model._model, sim.data._data)
-        mujoco.mj_step2(sim.model._model, sim.data._data)
+        # ``mj_step1`` followed by ``mj_step2`` is a complete integration step.
+        # It advances time and changes qpos / qvel, which makes a dataset state
+        # replay start one MuJoCo step away from the recorded row.  Forward
+        # dynamics updates kinematics and sensors without changing the state.
+        mujoco.mj_forward(sim.model._model, sim.data._data)
 

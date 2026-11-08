@@ -3,7 +3,7 @@ project_root: ../..
 
 dp:
   repo: ../dp_hirol_main
-  checkpoint: ../dp_hirol_main/data/outputs/2026.10.31/14.44.46_sim_force_aware_dp_train_20hz_lstm2_libero_open_top_drawer_put_bowl_20hz_force_aware/checkpoints/optimizer_step=00060000.ckpt
+  checkpoint: ../dp_hirol_main/data/outputs/2026.11.05/22.45.54_375874_dp_distill_pipeline/teacher/checkpoints/optimizer_step=00180000.ckpt
   backbone: ../dp_hirol_main/model/model/dinov3-vitb16-pretrain-lvd1689m
   state_key: ema_model
   diffusion_steps: null # Restore the checkpoint's DDIM inference steps (8).
@@ -11,7 +11,7 @@ dp:
 cad_wm:
   repo: cad-wm
   train_config: cad-wm/config/bench_train_config/libero_drawer_wrench_h5.yaml
-  checkpoint: null # Fill in the trained CAD-WM .pt path; required for inference.
+  checkpoint: cad-wm/outputs/cad_wm_median3_200k/checkpoints/step_00180000.pt
   device: null # Same as runtime.device unless overridden.
   steps: null # Restore flow integration settings from the CAD-WM checkpoint.
   solver: null
@@ -22,10 +22,17 @@ runtime:
   amp_enabled: true # DP only; CAD-WM follows WrenchPredictor's float32 path.
   amp_dtype: bfloat16
   timing_tolerance_s: 0.001
+  # The DP teacher was trained from the raw wrench LeRobot dataset.  Use the
+  # measured phase stream for its causal hysteresis state; future wrench input
+  # still always comes from CAD-WM.
   # cad_wm: previous forecast's first token estimates current phase wrench.
-  # measured: current measured wrench is used only for phase history.
+  # measured: current measured wrench is used for phase history.
   # Future network wrench always comes from CAD-WM in either mode.
-  phase_wrench_source: cad_wm
+  phase_wrench_source: measured
+  # The checkpoint was trained with token_threshold.  At deployment the
+  # CAD-WM forecast is stochastic, so use its existing causal hysteresis
+  # rollout to avoid toggling the image-only/fused branch at 8 N.
+  future_contact_mode: legacy_rollout
 
 # Optional offline replay: uses only images and histories ending at each row.
 # It emits pose predictions; it does not step a simulator or execute a robot.
@@ -35,7 +42,7 @@ replay:
   start_frame: 0
   max_frames: 100
   predict_every: 1
-  output: outputs/inference/fdp_cad_wm_demo_0.npz
+  output: outputs/inference/fdp_cad_wm_teacher_180k_raw_wm_demo_0.npz
   fields:
     timestamp: states # First column, seconds.
     q: obs/joint_states

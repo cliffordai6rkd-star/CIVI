@@ -1,4 +1,4 @@
-"""Temporal alignment, DP phase semantics, and training/inference integration."""
+"""Temporal alignment, offline phase labels, and training/inference integration."""
 
 import copy
 import json
@@ -224,15 +224,37 @@ def test_grouped_h5_slices_alignment_and_episode_boundaries(config):
     assert "wrench" not in first and "action" not in first
 
 
-def test_dp_equal_threshold_debounce_and_strict_boundaries(config):
+def test_offline_equal_threshold_debounce_and_strict_boundaries(config):
     config["contact_gate"]["precontact_seconds"] = 0
     signal = [9] * 4 + [8] + [9] * 5 + [8] + [7] * 4 + [8] + [7] * 5
     wrench = torch.zeros(len(signal), 6)
     wrench[:, 0] = torch.tensor(signal)
     wrench[:, 3:] = 10000
-    assert wrench_phase_labels(wrench, config, 20).tolist() == [0] * 9 + [2] * 11 + [0]
+    assert wrench_phase_labels(wrench, config, 20).tolist() == [0] * 5 + [2] * 11 + [0] * 5
     config["contact_gate"]["precontact_seconds"] = 0.2
-    assert wrench_phase_labels(wrench, config, 20).tolist() == [0] * 5 + [1] * 4 + [2] * 11 + [0]
+    assert wrench_phase_labels(wrench, config, 20).tolist() == [0] + [1] * 4 + [2] * 11 + [0] * 5
+
+
+@pytest.mark.parametrize("signal,expected", [
+    ([9] * 4, [0] * 4),
+    ([9] * 5, [2] * 5),
+    ([9] * 5 + [7] * 4, [2] * 9),
+    ([9] * 5 + [7] * 5, [2] * 5 + [0] * 5),
+    ([9] * 5 + [7] * 4 + [9] * 2 + [7] * 5, [2] * 11 + [0] * 5),
+    ([9] * 5 + [7] * 5 + [9] * 4, [2] * 5 + [0] * 9),
+])
+def test_offline_contact_requires_complete_windows_and_preserves_short_dips(config, signal, expected):
+    config["contact_gate"]["precontact_seconds"] = 0
+    wrench = torch.zeros(len(signal), 6)
+    wrench[:, 0] = torch.tensor(signal)
+    assert wrench_phase_labels(wrench, config, 20).tolist() == expected
+
+
+def test_offline_contact_backfills_different_entry_and_exit_lengths(config):
+    config["contact_gate"].update(contact_enter_frames=3, contact_exit_frames=2, precontact_seconds=0)
+    wrench = torch.zeros(6, 6)
+    wrench[:, 0] = torch.tensor([9, 9, 9, 8, 7, 7])
+    assert wrench_phase_labels(wrench, config, 20).tolist() == [2, 2, 2, 2, 0, 0]
 
 
 def test_normalizer_uses_only_training_demo(config):

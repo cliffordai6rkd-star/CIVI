@@ -1,11 +1,65 @@
 import os
 import re
+import select
+import sys
+import threading
+import xml.etree.ElementTree as ET
+import inspect
+from pathlib import Path
 import numpy as np
-import requests
+import h5py
 from typing import Tuple, Optional, List, Dict, Any, Union, Sequence
 from tqdm import tqdm
 
 import torch
+import mujoco
+
+try:
+    import requests
+except ImportError:  # keep the simulator evaluator usable in the lean env
+    import json as _json
+    from urllib import request as _urlrequest
+
+    class _URLResponse:
+        def __init__(self, response):
+            self._response = response
+            self.status_code = int(getattr(response, "status", 200))
+            self.ok = 200 <= self.status_code < 400
+            self._body = None
+
+        def _read_body(self):
+            if self._body is None:
+                self._body = self._response.read()
+            return self._body
+
+        def raise_for_status(self):
+            if not self.ok:
+                raise RuntimeError(f"HTTP request failed ({self.status_code}): {self.text[:2000]}")
+
+        @property
+        def text(self):
+            return self._read_body().decode("utf-8", errors="replace")
+
+        def json(self):
+            return _json.loads(self.text)
+
+    class _URLSession:
+        @staticmethod
+        def get(url):
+            return _URLResponse(_urlrequest.urlopen(url))
+
+        @staticmethod
+        def post(url, json=None):
+            body = _json.dumps(json).encode("utf-8")
+            request = _urlrequest.Request(
+                url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+            )
+            return _URLResponse(_urlrequest.urlopen(request))
+
+    class _RequestsCompat:
+        Session = _URLSession
+
+    requests = _RequestsCompat()
 
 from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
@@ -21,6 +75,7 @@ from robokit.connects.protocols import StepRequestFromPolicy, StepRequestFromEva
 from robokit.data_manager.utils_multiview import cat_multiview_video_with_another
 from robokit.debug_utils.images import concatenate_rgb_images, save_frames_as_video, plot_force_sensor_wrt_time
 from robokit.debug_utils.printer import print_batch
+from scripts.wrench_replay_plot import WrenchLivePlot
 
 
 class SingleForceEnv:
@@ -29,21 +84,60 @@ class SingleForceEnv:
             hdf5_read_path: str = None,
             camera_hw: tuple = (128, 128),
             env_seed: int = 0,
-            libero_code_root: str = "/home/geyuan/code/LIBERO-FT/",
+            libero_code_root: str = None,
             bddl_path: str = None,
             benchmark_task_suite_name: str = None,  # in `libero_{10/90/object/goal/spatial}`
+            show_viewer: bool = False,
+            terminal_interactive: bool = False,
+            show_wrench_plot: bool = False,
+            wrench_plot_backend: str = "TkAgg",
+            wrench_plot_max_points: int = 400,
             # PhysicsHelper params
             phy_keywords: tuple = ("cabinet", "drawer", "door", "basket", "object", "tool"),
     ):
         self.hdf5_read_path = hdf5_read_path
         self.camera_hw = camera_hw
         self.env_seed = env_seed
+        # Keep all files used to reconstruct an HDF5 scene anchored to the
+        # checkout supplied by the caller.  LIBERO's ``get_libero_path``
+        # reads a process-global ~/.libero/config.yaml, which may point to a
+        # different checkout and is not needed when the demo stores its full
+        # flattened state.
+        checkout_root = (
+            Path(libero_code_root).expanduser()
+            if libero_code_root is not None
+            else Path(__file__).resolve().parents[2]
+        )
+        self.libero_code_root = str(checkout_root.resolve())
+        self.show_viewer = bool(show_viewer)
+        self.terminal_interactive = bool(terminal_interactive)
+        self.show_wrench_plot = bool(show_wrench_plot)
+        self.wrench_plot_backend = wrench_plot_backend
+        self.wrench_plot_max_points = wrench_plot_max_points
+        self.wrench_plot = None
+        self._wrench_plot_disabled = False
+        self._wrench_plot_error_reported = False
+        self.interactive = self.show_viewer or self.terminal_interactive
+        # Viewer state is attached after the off-screen env is initialized.
+        self.mujoco_viewer = None
+        self._viewer_sim = None
+        # Native MuJoCo viewer callbacks run on the GUI thread.  Use events so
+        # the evaluator thread can safely pause, reset, and resume rollouts.
+        self._viewer_started = threading.Event()
+        self._viewer_reset_requested = threading.Event()
+        self._terminal_stop_requested = threading.Event()
+        self._terminal_input_closed = threading.Event()
+        self._terminal_thread = None
+        if not self.interactive:
+            self._viewer_started.set()
 
         self.step_cnt = 0
+        self._fdp_previous_qvel = None
 
         # 0) Create env
         assert (hdf5_read_path is not None or
-                bddl_path is not None is not None), \
+                bddl_path is not None or
+                benchmark_task_suite_name is not None), \
             "hdf5_read_path or bddl_path must be provided."
         if hdf5_read_path is not None:
             task_info = get_task_from_hdf5(hdf5_read_path)
@@ -61,7 +155,7 @@ class SingleForceEnv:
             task_bddl_file_path = task_info["bddl_file_from_h5"]
             task_env_kwargs = task_info["env_kwargs"]
 
-            self.bddl_path = os.path.join(libero_code_root, task_bddl_file_path)
+            self.bddl_path = self._resolve_checkout_file(task_bddl_file_path)
             self.task_name = task_name
             self.task_language = task_language
             self.hdf5_env_kwargs = task_env_kwargs
@@ -75,22 +169,58 @@ class SingleForceEnv:
 
             task_suite = benchmark.get_benchmark_dict()[task_suite_name]()
             task = task_suite.get_task(task_id)
-            self.init_states = task_suite.get_task_init_states(task_id)
-            # Note: can be used to set: env.set_init_state(init_states[init_state_id])
-            print("[DEBUG] loaded init_states cnt:", len(self.init_states))
+            self.task_suite_name = task_suite_name
+            self.task_id = int(task_id)
+            self.task_suite = task_suite
+            # HDF5 evaluation restores states[0] directly.  Delay loading the
+            # benchmark init file until a caller explicitly requests the
+            # benchmark fallback; this avoids depending on ~/.libero for the
+            # normal data-driven path.
+            self.init_states = None
+            print("[DEBUG] benchmark init states will be loaded lazily")
 
         elif bddl_path is not None:
-            self.bddl_path = bddl_path
+            self.bddl_path = self._resolve_checkout_file(bddl_path)
+            # Keep the standalone BDDL constructor usable by socket callers
+            # that only need an instruction string.  A direct BDDL path has
+            # no benchmark task metadata, so derive a stable human-readable
+            # fallback from its filename.
+            self.task_name = Path(self.bddl_path).stem
+            self.task_language = self.task_name.replace("_", " ")
+            self.init_states = None
+            self.hdf5_env_kwargs = {
+                "bddl_file_name": self.bddl_path,
+                "camera_heights": self.camera_hw[0],
+                "camera_widths": self.camera_hw[1],
+            }
         elif benchmark_task_suite_name is not None:
             print("[Warning] Using benchmark_task_suite_name to get BDDL path.")
             task_suite = benchmark.get_benchmark_dict()[benchmark_task_suite_name]()
             task = task_suite.get_task(0)  # just to get bddl path
-            init_states = task_suite.get_task_init_states(0)  # for benchmarking purpose, we fix the set of initial states
-            init_state_id = 0
-            self.bddl_path = os.path.join(
-                get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
+            self.task_suite_name = benchmark_task_suite_name
+            self.task_id = 0
+            self.task_suite = task_suite
+            self.task_name = task.name
+            self.task_language = task.language
+            self.init_states = None
+            self.bddl_path = self._resolve_checkout_file(
+                os.path.join("libero", "libero", "bddl_files", task.problem_folder, task.bddl_file)
+            )
+            self.hdf5_env_kwargs = {
+                "bddl_file_name": self.bddl_path,
+                "camera_heights": self.camera_hw[0],
+                "camera_widths": self.camera_hw[1],
+            }
 
         self.init_env()
+        if getattr(self, "show_viewer", False):
+            self.start_viewer()
+        if self.show_wrench_plot:
+            self.wrench_plot = WrenchLivePlot(
+                title=f"Live wrench | {self.task_name}",
+                max_points=self.wrench_plot_max_points,
+                backend=self.wrench_plot_backend,
+            )
 
         # 1) PhysicsHelper for dynamics randomization
         self.physics_helper = PhysicsHelper(
@@ -106,6 +236,71 @@ class SingleForceEnv:
 
         print("[Info] SingleForceEnv initialized with BDDL:", self.bddl_path)
 
+    def _resolve_checkout_file(self, value: str) -> str:
+        """Resolve a LIBERO file against the requested checkout.
+
+        HDF5 metadata may contain either ``libero/libero/...`` paths from this
+        repository or the shorter ``libero/...`` form used by older exports.
+        Absolute paths remain valid when they exist; otherwise the checkout
+        candidates are tried before returning the first deterministic path so
+        MuJoCo reports a useful missing-file error.
+        """
+        raw = os.path.expanduser(str(value))
+        path = os.path.abspath(raw) if os.path.isabs(raw) else None
+        if path is not None and os.path.isfile(path):
+            return path
+        root = self.libero_code_root
+        candidates = []
+        if path is not None:
+            candidates.append(path)
+        else:
+            candidates.extend([
+                os.path.join(root, raw),
+                os.path.join(root, "libero", raw),
+            ])
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                return os.path.abspath(candidate)
+        # Return the most natural checkout-relative path for a clear error
+        # from the downstream environment if none of the candidates exists.
+        return os.path.abspath(candidates[0] if candidates else os.path.join(root, raw))
+
+    def _load_benchmark_init_states(self):
+        """Load benchmark initial states only when the fallback is used."""
+        if self.init_states is not None:
+            return self.init_states
+        suite = getattr(self, "task_suite", None)
+        task_id = getattr(self, "task_id", None)
+        suite_name = getattr(self, "task_suite_name", None)
+        if suite is None or task_id is None or suite_name is None:
+            raise RuntimeError("benchmark initial states are unavailable for this environment")
+
+        task = suite.get_task(int(task_id))
+        local_path = os.path.join(
+            self.libero_code_root,
+            "libero", "libero", "init_files", suite_name,
+            task.init_states_file,
+        )
+        if not os.path.isfile(local_path):
+            # Support callers that pass the package directory itself as the
+            # checkout root, and finally preserve LIBERO's configured-path
+            # fallback for installations outside this repository.
+            local_path = os.path.join(
+                self.libero_code_root, "libero", "init_files", suite_name,
+                task.init_states_file,
+            )
+        if os.path.isfile(local_path):
+            try:
+                self.init_states = torch.load(local_path, weights_only=False)
+            except TypeError:  # PyTorch < 2.6
+                self.init_states = torch.load(local_path)
+        else:
+            self.init_states = suite.get_task_init_states(int(task_id))
+        if len(self.init_states) == 0:
+            raise RuntimeError(f"No benchmark initial states found in {local_path}")
+        print("[DEBUG] loaded init_states cnt:", len(self.init_states))
+        return self.init_states
+
     def init_env(self):
         base_env = OffScreenRenderEnv(
             **self.hdf5_env_kwargs
@@ -117,31 +312,353 @@ class SingleForceEnv:
         )
         self.reset_env()
 
+    def _disable_wrench_plot(self, error: Exception) -> None:
+        """Disable only plotting after a GUI error so rollout errors propagate."""
+        if not self._wrench_plot_error_reported:
+            print(f"[wrench-plot] disabled after update error: {error}", flush=True)
+            self._wrench_plot_error_reported = True
+        self._wrench_plot_disabled = True
+        if self.wrench_plot is not None:
+            try:
+                self.wrench_plot.close()
+            except Exception:
+                pass
+
+    def _reset_wrench_plot(self) -> None:
+        if self.wrench_plot is None or self._wrench_plot_disabled:
+            return
+        try:
+            self.wrench_plot.reset()
+        except Exception as exc:
+            self._disable_wrench_plot(exc)
+
+    def _record_wrench(self, wrench: np.ndarray, timestamp_s: float) -> None:
+        """Feed one measured sample to the optional GUI without altering control."""
+        if self.wrench_plot is None or self._wrench_plot_disabled:
+            return
+        try:
+            self.wrench_plot.update(timestamp_s, wrench)
+            self.wrench_plot.pump()
+        except Exception as exc:
+            self._disable_wrench_plot(exc)
+
+    def record_wrench_prediction(
+        self,
+        anchor_timestamp_s: float,
+        future_offsets_s: np.ndarray,
+        future_wrench: np.ndarray,
+    ) -> None:
+        """Feed the current CAD-WM horizon to the optional GUI."""
+        if self.wrench_plot is None or self._wrench_plot_disabled:
+            return
+        try:
+            self.wrench_plot.update_prediction(
+                anchor_timestamp_s, future_offsets_s, future_wrench
+            )
+            self.wrench_plot.pump()
+        except Exception as exc:
+            self._disable_wrench_plot(exc)
+
     def close_env(self):
+        self.stop_terminal_listener()
+        if self.wrench_plot is not None:
+            try:
+                self.wrench_plot.close()
+            except Exception:
+                pass
+            self.wrench_plot = None
+        if self.mujoco_viewer is not None:
+            self.mujoco_viewer.close()
+            self.mujoco_viewer = None
+            self._viewer_sim = None
         self.env.close()
+
+    def start_viewer(self):
+        """Open MuJoCo's native passive viewer for the live simulator state."""
+        sim = self.env.env.sim
+        if self.mujoco_viewer is not None and self._viewer_sim is sim:
+            return
+        import mujoco.viewer
+        # robosuite may rebuild the simulator during reset().  A passive viewer
+        # keeps the model/data objects supplied at launch, so rebind it when
+        # the active sim changes or the window would display a frozen episode.
+        if self.mujoco_viewer is not None:
+            self.mujoco_viewer.close()
+            self.mujoco_viewer = None
+        model = getattr(sim.model, "_model", sim.model)
+        data = getattr(sim.data, "_data", sim.data)
+        self.mujoco_viewer = mujoco.viewer.launch_passive(
+            model, data, key_callback=self._viewer_key_callback
+        )
+        self._viewer_sim = sim
+        # ``OffScreenRenderEnv`` is configured with ``render_collision_mesh=False``
+        # for the existing LIBERO scene.  MuJoCo's native viewer does not inherit
+        # that robosuite flag and otherwise draws the Panda's group-0 collision
+        # meshes on top of the visual meshes.  The overlapping collision meshes can
+        # look like self-interference (especially around the wrist) and obscure the
+        # inference rollout.  Keep physics collisions enabled, but show the same
+        # visual geometry as the project's camera renderer.
+        viewer_opt = getattr(self.mujoco_viewer, "opt", None)
+        if viewer_opt is not None and hasattr(viewer_opt, "geomgroup"):
+            viewer_opt.geomgroup[:] = 0
+            # LIBERO/robosuite visual meshes use geom group 1.
+            if viewer_opt.geomgroup.shape[0] > 1:
+                viewer_opt.geomgroup[1] = 1
+        self.mujoco_viewer.sync()
+        print("[viewer] paused; press 's' to start inference, 'i' to reset")
+
+    def _viewer_key_callback(self, key: int):
+        """Handle the small interactive control surface for the passive viewer."""
+        key = int(key)
+        if key in (ord("s"), ord("S")):
+            self.request_inference_start(source="viewer")
+        elif key in (ord("i"), ord("I")):
+            # Reset is consumed by the evaluator thread, which owns the env and
+            # policy HTTP session.  Pausing here avoids stepping while reset is
+            # being applied from the callback thread.
+            self.request_reset(source="viewer")
+
+    def request_inference_start(self, source: str = "control"):
+        self._viewer_started.set()
+        print(f"[{source}] inference started", flush=True)
+
+    def request_reset(self, source: str = "control"):
+        self._viewer_reset_requested.set()
+        self._viewer_started.clear()
+        print(f"[{source}] reset requested; press 's' to resume", flush=True)
+
+    def _handle_terminal_key(self, key: str):
+        key = key.strip()[:1].lower()
+        if key == "s":
+            self.request_inference_start(source="terminal")
+        elif key == "i":
+            self.request_reset(source="terminal")
+
+    def _terminal_input_loop(self):
+        """Read one-character s/i commands without blocking the evaluator."""
+        stream = sys.stdin
+        is_tty = bool(getattr(stream, "isatty", lambda: False)())
+        tty_stream = None
+        old_termios = None
+        fd = None
+        try:
+            # ``conda run`` can detach stdin from the controlling terminal.
+            # Reopen /dev/tty so s/i still work in the user's terminal.
+            if not is_tty:
+                try:
+                    tty_stream = open("/dev/tty", "rb", buffering=0)
+                    stream = tty_stream
+                    is_tty = True
+                except OSError:
+                    tty_stream = None
+            if is_tty:
+                import termios
+                import tty
+
+                fd = stream.fileno()
+                old_termios = termios.tcgetattr(fd)
+                tty.setcbreak(fd)
+                while not self._terminal_stop_requested.is_set():
+                    readable, _, _ = select.select([fd], [], [], 0.2)
+                    if not readable:
+                        continue
+                    key = os.read(fd, 1).decode("utf-8", errors="ignore")
+                    self._handle_terminal_key(key)
+            else:
+                # This keeps --interactive usable in a pipe or a test harness.
+                while not self._terminal_stop_requested.is_set():
+                    line = stream.readline()
+                    if line == "":
+                        break
+                    self._handle_terminal_key(line)
+        except (EOFError, OSError, select.error):
+            pass
+        finally:
+            if old_termios is not None and fd is not None:
+                try:
+                    import termios
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_termios)
+                except (OSError, termios.error):
+                    pass
+            if tty_stream is not None:
+                try:
+                    tty_stream.close()
+                except OSError:
+                    pass
+            self._terminal_input_closed.set()
+
+    def start_terminal_listener(self):
+        if not self.terminal_interactive:
+            return
+        if self._terminal_thread is not None and self._terminal_thread.is_alive():
+            return
+        self._terminal_stop_requested.clear()
+        self._terminal_input_closed.clear()
+        self._terminal_thread = threading.Thread(
+            target=self._terminal_input_loop,
+            name="libero-terminal-control",
+            daemon=True,
+        )
+        self._terminal_thread.start()
+        print("[terminal] paused; press 's' to start inference, 'i' to reset", flush=True)
+
+    def stop_terminal_listener(self):
+        self._terminal_stop_requested.set()
+        thread = self._terminal_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=0.5)
+        self._terminal_thread = None
+
+    def wait_for_inference_start(self) -> bool:
+        """Wait for s in terminal/viewer interactive mode."""
+        if not self.interactive:
+            return True
+        while True:
+            if self._viewer_started.wait(timeout=0.1):
+                return True
+            # A viewer remains a valid control surface even when conda run
+            # detached stdin and no /dev/tty is available.
+            if (
+                self._terminal_input_closed.is_set()
+                and self.terminal_interactive
+                and not self.show_viewer
+            ):
+                return False
+            if self.show_viewer and (
+                self.mujoco_viewer is None or not self.mujoco_viewer.is_running()
+            ):
+                return False
+
+    # Backwards-compatible name for callers that used the viewer-only API.
+    wait_for_viewer_start = wait_for_inference_start
+
+    def consume_reset_request(self) -> bool:
+        """Return and clear a pending terminal/viewer reset request."""
+        if not self._viewer_reset_requested.is_set():
+            return False
+        self._viewer_reset_requested.clear()
+        return True
+
+    consume_viewer_reset = consume_reset_request
+
+    def clear_inference_start(self):
+        """Pause before the next episode in interactive mode."""
+        if self.interactive:
+            self._viewer_started.clear()
+
+    clear_viewer_start = clear_inference_start
 
     def reset_env(self, env_seed: Optional[int] = None):
         self.env_seed = env_seed if env_seed is not None else self.env_seed
         self.env.seed(self.env_seed)
         self.env.reset()
         self.step_cnt = 0
+        self._fdp_previous_qvel = None
+        self._reset_wrench_plot()
         if hasattr(self, "visual_helper"):
             self.visual_helper.clear_dynamic_light_base()
             self.visual_helper.clear_camera_shift_base()
+        if self.mujoco_viewer is not None:
+            self.start_viewer()
 
     def reset_to_benchmark_init(self, init_state_id=0, settle_steps=5, env_seed: Optional[int] = None):
         self.reset_env(env_seed=env_seed)
-        self.env.set_init_state(self.init_states[init_state_id % len(self.init_states)])
+        init_states = self._load_benchmark_init_states()
+        self.env.set_init_state(init_states[init_state_id % len(init_states)])
         assert settle_steps > 0, "settle_steps must be greater than 0."
         for _ in range(settle_steps):
             obs, _, _, _ = self.env.step(np.zeros(7, dtype=np.float32))
         return obs
 
+    def reset_to_dataset_init(
+            self,
+            state,
+            model_file: Optional[str] = None,
+            env_seed: Optional[int] = None,
+    ):
+        """Reset the simulator and apply only a dataset episode's first state."""
+        self.reset_env(env_seed=env_seed)
+        return self.set_dataset_state_without_reset(state, model_file=model_file)
+
+    def apply_dataset_model_file(self, model_file: Optional[str]):
+        """Restore per-demo body transforms stored in a LIBERO model XML.
+
+        The flattened MuJoCo state contains joint state, time and actuator
+        state, but static fixture placement (for example the cabinet body) is
+        stored in the demo's ``model_file`` attribute.  Reapply those body
+        transforms to the current BDDL-built model before restoring the state.
+        This avoids loading old absolute mesh paths while preserving the
+        recorded scene placement.
+        """
+        if model_file is None:
+            return
+        if isinstance(model_file, bytes):
+            model_file = model_file.decode("utf-8")
+        try:
+            root = ET.fromstring(str(model_file))
+        except (ET.ParseError, TypeError, ValueError) as exc:
+            raise ValueError("Dataset model_file is not valid MuJoCo XML") from exc
+
+        model = self.env.env.sim.model
+        matched = 0
+        updated = 0
+        for body in root.iter("body"):
+            name = body.get("name")
+            if not name:
+                continue
+            try:
+                body_id = int(model.body_name2id(name))
+            except Exception:
+                # The current checkout may omit an auxiliary body that was
+                # present in the recording.  Matching bodies are still
+                # restored below.
+                continue
+            matched += 1
+            if body.get("pos") is not None:
+                position = np.fromstring(body.get("pos"), sep=" ", dtype=np.float64)
+                if position.shape != (3,) or not np.isfinite(position).all():
+                    raise ValueError(f"Dataset model_file body {name!r} has invalid pos")
+                model.body_pos[body_id] = position
+                updated += 1
+            if body.get("quat") is not None:
+                quaternion = np.fromstring(body.get("quat"), sep=" ", dtype=np.float64)
+                if quaternion.shape != (4,) or not np.isfinite(quaternion).all():
+                    raise ValueError(f"Dataset model_file body {name!r} has invalid quat")
+                model.body_quat[body_id] = quaternion
+                updated += 1
+        if matched == 0:
+            raise ValueError("Dataset model_file contains no bodies matching the current MuJoCo model")
+        self.env.env.sim.forward()
+
+    def set_dataset_state_without_reset(self, state, model_file: Optional[str] = None):
+        """Apply a dataset state after a visual XML reset rebuilt the simulator."""
+        state = np.asarray(state, dtype=np.float64)
+        current_state = np.asarray(self.env.env.get_sim_state())
+        if state.ndim != 1 or state.shape != current_state.shape:
+            raise ValueError(
+                "Dataset initial state shape mismatch: "
+                f"expected {current_state.shape}, got {state.shape}"
+            )
+        self._reset_wrench_plot()
+        self.apply_dataset_model_file(model_file)
+        self.env.set_flattened_state_and_forward(state)
+        self.step_cnt = 0
+        self._fdp_previous_qvel = None
+        if self.mujoco_viewer is not None:
+            self.start_viewer()
+            self.mujoco_viewer.sync()
+        return self.regenerate_obs_from_current_state()
+
     def set_benchmark_init_without_reset(self, init_state_id=0, settle_steps=5):
         self.step_cnt = 0
+        self._fdp_previous_qvel = None
+        self._reset_wrench_plot()
         self.visual_helper.clear_dynamic_light_base()
         self.visual_helper.clear_camera_shift_base()
-        self.env.set_init_state(self.init_states[init_state_id % len(self.init_states)])
+        init_states = self._load_benchmark_init_states()
+        self.env.set_init_state(init_states[init_state_id % len(init_states)])
+        if self.mujoco_viewer is not None:
+            self.start_viewer()
         if hasattr(self.env, "build_reader_if_needed"):
             self.env.build_reader_if_needed()
         assert settle_steps > 0, "settle_steps must be greater than 0."
@@ -152,8 +669,40 @@ class SingleForceEnv:
     def step(self, action_D: np.ndarray):
         obs, reward, done, info = self.env.step(action_D)
         self.step_cnt += 1
+        wrench = obs.get("wrench_ee") if isinstance(obs, dict) else None
+        if wrench is not None:
+            self._record_wrench(
+                wrench,
+                timestamp_s=float(self.step_cnt) * self.control_timestep,
+            )
+        if self.mujoco_viewer is not None and self.mujoco_viewer.is_running():
+            self.start_viewer()
+            self.mujoco_viewer.sync()
         success = self.check_success()
         return obs, reward, done, {**info, "success": success}
+
+    @property
+    def control_timestep(self) -> float:
+        """Seconds between simulator observations used by the policy stream."""
+        offscreen_env = self.env.env
+        base_env = getattr(offscreen_env, "env", None)
+        value = getattr(offscreen_env, "control_timestep", None)
+        if value is None and base_env is not None:
+            value = getattr(base_env, "control_timestep", None)
+        if value is None:
+            frequency = getattr(offscreen_env, "control_freq", None)
+            if frequency is None and base_env is not None:
+                frequency = getattr(base_env, "control_freq", None)
+        else:
+            frequency = None
+        if value is None:
+            if frequency is None:
+                raise RuntimeError("LIBERO environment does not expose control frequency")
+            value = 1.0 / float(frequency)
+        value = float(value)
+        if not np.isfinite(value) or value <= 0:
+            raise RuntimeError(f"Invalid simulator control timestep: {value}")
+        return value
 
     def check_success(self):
         return bool(self.env.env.check_success())
@@ -162,7 +711,80 @@ class SingleForceEnv:
         sim_state = self.env.env.get_sim_state()
         obs = self.env.env.regenerate_obs_from_state(sim_state)
         obs["wrench_ee"] = self.env.read_wrench_from_sim()
+        self._record_wrench(
+            obs["wrench_ee"],
+            timestamp_s=float(self.step_cnt) * self.control_timestep,
+        )
         return obs
+
+    def fdp_state(self, obs, timestamp_s: float):
+        """Return the causal state contract consumed by the FDP interface.
+
+        The legacy socket protocol only carried TCP pose and wrench. FDP's
+        CAD-WM requires the seven arm joint q/dq/tau vectors, so extract them
+        from robosuite's reference indices and attach the current EEF pose.
+        """
+        base_env = self.env.env
+        robots = getattr(base_env, "robots", None)
+        if not robots:
+            raise RuntimeError("LIBERO environment has no robot state for FDP")
+        robot = robots[0]
+        q_indices = np.asarray(robot._ref_joint_pos_indexes[:7], dtype=np.int64)
+        dq_indices = np.asarray(robot._ref_joint_vel_indexes[:7], dtype=np.int64)
+        sim = base_env.sim
+        q = np.asarray(sim.data.qpos[q_indices], dtype=np.float32)
+        dq = np.asarray(sim.data.qvel[dq_indices], dtype=np.float32)
+        # The training HDF5 stores inverse-dynamics torque.  ``mj_forward``
+        # does not guarantee that qacc describes the observed q/dq stream, so
+        # never pass a stale qacc into mj_inverse.  Use the causal backward
+        # acceleration estimate from the previous simulator frame instead.
+        qvel_full = np.asarray(sim.data.qvel, dtype=np.float64).copy()
+        control_dt = self.control_timestep
+        if not np.isfinite(control_dt) or control_dt <= 0:
+            raise RuntimeError(f"Invalid simulator control timestep: {control_dt}")
+        if self._fdp_previous_qvel is None:
+            qacc_full = np.zeros_like(qvel_full)
+        else:
+            qacc_full = (qvel_full - self._fdp_previous_qvel) / control_dt
+        previous_qacc = np.asarray(sim.data.qacc, dtype=np.float64).copy()
+        sim.data.qacc[:] = qacc_full
+        try:
+            mujoco.mj_inverse(sim.model._model, sim.data._data)
+            tau_all = np.asarray(getattr(sim.data, "qfrc_inverse", []), dtype=np.float32)
+            if tau_all.size:
+                tau = tau_all[dq_indices]
+            else:
+                tau = np.asarray(sim.data.qfrc_actuator[dq_indices], dtype=np.float32)
+            if not np.isfinite(tau).all():
+                tau = np.asarray(sim.data.qfrc_actuator[dq_indices], dtype=np.float32)
+        finally:
+            sim.data.qacc[:] = previous_qacc
+        self._fdp_previous_qvel = qvel_full
+        state = {
+            "timestamp_s": float(timestamp_s),
+            "q": q.tolist(),
+            "dq": dq.tolist(),
+            "tau": tau.tolist(),
+            "eef_pos": np.asarray(obs["robot0_eef_pos"], dtype=np.float32).tolist(),
+            "eef_quat": np.asarray(obs["robot0_eef_quat"], dtype=np.float32).tolist(),
+        }
+        controller = getattr(robot, "controller", None)
+        action_min = getattr(controller, "output_min", None)
+        action_max = getattr(controller, "output_max", None)
+        if action_min is not None and action_max is not None:
+            action_min = np.asarray(action_min, dtype=np.float32).reshape(-1)
+            action_max = np.asarray(action_max, dtype=np.float32).reshape(-1)
+            if (action_min.shape == (6,) and action_max.shape == (6,)
+                    and np.isfinite(action_min).all() and np.isfinite(action_max).all()
+                    and np.all(action_max > action_min)):
+                state["osc_action_min"] = action_min.tolist()
+                state["osc_action_max"] = action_max.tolist()
+        if "wrench_ee" in obs:
+            state["wrench"] = np.asarray(obs["wrench_ee"], dtype=np.float32).tolist()
+        for key, value in (("q", q), ("dq", dq), ("tau", tau)):
+            if value.shape != (7,) or not np.isfinite(value).all():
+                raise RuntimeError(f"FDP state {key} must be finite with shape [7]")
+        return state
 
     def apply_physics_shift(
             self,
@@ -269,7 +891,7 @@ class LiberoForceSocketEvaluator:
             hdf5_read_path: str = None,
             camera_hw: tuple = (128, 128),
             env_seed: int = 0,
-            libero_code_root: str = "/home/geyuan/code/LIBERO-FT/",
+            libero_code_root: str = None,
             bddl_path: str = None,
             benchmark_task_suite_name: str = None,  # in `libero_{10/90/object/goal/spatial}`
             # PhysicsHelper params
@@ -279,8 +901,13 @@ class LiberoForceSocketEvaluator:
             test_start_seed: int = 10000,
             test_max_steps: int = 400,
             # Socket related
-            policy_url='localhost:6006',
+            policy_url='http://localhost:6006',
             send_per_frames: int = 1,
+            interface: str = "legacy",
+            show_viewer: bool = False,
+            terminal_interactive: bool = False,
+            show_wrench_plot: bool = False,
+            wrench_plot_backend: str = "TkAgg",
     ):
         self.env = SingleForceEnv(
             hdf5_read_path=hdf5_read_path,
@@ -289,9 +916,45 @@ class LiberoForceSocketEvaluator:
             libero_code_root=libero_code_root,
             bddl_path=bddl_path,
             benchmark_task_suite_name=benchmark_task_suite_name,
+            show_viewer=show_viewer,
+            terminal_interactive=terminal_interactive,
+            show_wrench_plot=show_wrench_plot,
+            wrench_plot_backend=wrench_plot_backend,
             phy_keywords=phy_keywords,
         )
         self.language_goal = self.env.task_name.replace("_", " ")
+        self.terminal_interactive = bool(terminal_interactive)
+
+        # The HDF5 demo states contain the scene placement used by LIBERO-FT.
+        # We use only states[0] for episode initialization; policy actions still
+        # drive every subsequent simulator step.
+        self.dataset_initial_states = []
+        self.dataset_initial_model_files = []
+        if hdf5_read_path is not None:
+            with h5py.File(hdf5_read_path, "r") as h5_file:
+                demo_keys = sorted(
+                    (key for key in h5_file["data"].keys() if key.startswith("demo_")),
+                    key=lambda key: int(key.split("_", 1)[1]),
+                )
+                for demo_key in demo_keys:
+                    demo_group = h5_file["data"][demo_key]
+                    if "states" in demo_group and len(demo_group["states"]) > 0:
+                        self.dataset_initial_states.append(
+                            np.asarray(demo_group["states"][0], dtype=np.float64)
+                        )
+                        model_file = demo_group.attrs.get(
+                            "model_file", h5_file["data"].attrs.get("model_file")
+                        )
+                        if isinstance(model_file, bytes):
+                            model_file = model_file.decode("utf-8")
+                        self.dataset_initial_model_files.append(
+                            None if model_file is None else str(model_file)
+                        )
+        if self.dataset_initial_states:
+            print(
+                "[LiberoForceSocketEvaluator] loaded dataset initial states:",
+                len(self.dataset_initial_states),
+            )
 
         # Eval related
         self.test_cnt = test_cnt
@@ -300,10 +963,20 @@ class LiberoForceSocketEvaluator:
         self.test_max_steps = test_max_steps
 
         # Socket related
-        self.policy_url = policy_url
+        policy_url = str(policy_url).strip()
+        if "://" not in policy_url:
+            policy_url = f"http://{policy_url}"
+        self.policy_url = policy_url.rstrip("/")
         self.send_per_frames = send_per_frames
+        if interface not in {"legacy", "fdp"}:
+            raise ValueError("interface must be legacy or fdp")
+        self.interface = interface
         self.send_cnt = 0
         self.cache_actions_B_T_D = None
+        self.latest_future_wrench = None
+        self.latest_future_offsets_s = None
+        self.latest_prediction_timestamp_s = None
+        self.latest_prediction_updated = False
         self.http_session = requests.Session()
         self.task_instruction = None
         self.cache_actions_B_T_D = None
@@ -314,16 +987,67 @@ class LiberoForceSocketEvaluator:
             'joint_state': [],
         }  # some policies require 2 or more observation frames
 
+    def _clear_stream_state(self):
+        self.send_cnt = 0
+        self.cache_actions_B_T_D = None
+        self.latest_future_wrench = None
+        self.latest_future_offsets_s = None
+        self.latest_prediction_timestamp_s = None
+        self.latest_prediction_updated = False
+        self.cache_frames_B_H_W_C = None
+        self.frame_buffer = {
+            "primary_rgb": [],
+            "gripper_rgb": [],
+            "joint_state": [],
+        }
+
+    def _set_cache_horizon(self, value):
+        """Normalize cache metadata returned by different robokit versions."""
+        if value is None:
+            value = self.send_per_frames
+        if isinstance(value, (list, tuple, np.ndarray)):
+            if len(value) != 1:
+                raise ValueError(f"max_cache_action must be a scalar, got {value!r}")
+            value = value[0]
+        try:
+            numeric = float(value)
+            value = int(numeric)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"invalid max_cache_action={value!r}") from exc
+        if not np.isfinite(numeric) or numeric != value:
+            raise ValueError(f"max_cache_action must be an integer, got {value!r}")
+        if value < 1:
+            raise ValueError(f"max_cache_action must be positive, got {value}")
+        self.send_per_frames = value
+        return value
+
+    def _validate_policy_timing(self, response):
+        """Reject an FDP service whose native rate differs from MuJoCo."""
+        if self.interface != "fdp" or not isinstance(response, dict):
+            return
+        policy_dt = response.get("timestamp_step_sec")
+        if policy_dt is None:
+            return  # Older services do not advertise the contract.
+        try:
+            policy_dt = float(policy_dt)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid policy timestamp_step_sec={policy_dt!r}") from exc
+        sim_dt = self.env.control_timestep
+        if not np.isfinite(policy_dt) or policy_dt <= 0 or not np.isclose(
+                policy_dt, sim_dt, atol=1e-6, rtol=1e-3
+        ):
+            raise RuntimeError(
+                f"FDP and MuJoCo rates differ: policy dt={policy_dt}, simulator dt={sim_dt}"
+            )
+
     def init_socket(self, task_instruction: str = None) -> int:
         resp = self.http_session.get(f"{self.policy_url}/init")
         resp.raise_for_status()
         resp = resp.json()
+        self._validate_policy_timing(resp)
 
-        max_cache_action = resp["max_cache_action"]
-        self.send_per_frames = max(max_cache_action, 1)
-        self.send_cnt = 0
-        self.cache_actions_B_T_D = None
-        self.cache_frames_B_H_W_C = None
+        max_cache_action = self._set_cache_horizon(resp.get("max_cache_action"))
+        self._clear_stream_state()
 
         if task_instruction is not None:
             self.task_instruction = task_instruction
@@ -343,12 +1067,10 @@ class LiberoForceSocketEvaluator:
         resp = self.http_session.get(f"{self.policy_url}/reset")
         resp.raise_for_status()
         resp = resp.json()
+        self._validate_policy_timing(resp)
 
-        max_cache_action = resp["max_cache_action"]
-        self.send_per_frames = max(max_cache_action, 1)
-        self.send_cnt = 0
-        self.cache_actions_B_T_D = None
-        self.cache_frames_B_H_W_C = None
+        max_cache_action = self._set_cache_horizon(resp.get("max_cache_action"))
+        self._clear_stream_state()
 
         print("[LiberoForceSocketEvaluator] Reset policy server:", self.policy_url,
               f"max_cache_action={max_cache_action}, send_per_frames={self.send_per_frames},"
@@ -359,31 +1081,88 @@ class LiberoForceSocketEvaluator:
                                 image_B_T_H_W_C: np.ndarray,
                                 stage_flag: int,
                                 robot_states_B_T_D: np.ndarray = None,
+                                fdp_state: dict = None,
                                 ) -> np.ndarray:
         assert self.task_instruction is not None, "Please call init_socket first."
+        self.latest_prediction_updated = False
 
         if self.send_cnt % self.send_per_frames == 0:
             video_B_v2_H_W_C = image_B_T_H_W_C  # (B,Ts,H,W,3) uint8
-            request_to_policy = StepRequestFromEvaluator.encode_from_raw(
-                instruction=self.task_instruction,
-                stage_flag=stage_flag,
-                gt_video=video_B_v2_H_W_C,  # (B,Ts,H,W,3) uint8
-                tcp_state=robot_states_B_T_D,  # (B,Ts,D) float32, not used
-                num_camera_views=2,
-                max_cache_action=self.send_per_frames,
-            )
+            encode_kwargs = {
+                "instruction": self.task_instruction,
+                "stage_flag": stage_flag,
+                "gt_video": video_B_v2_H_W_C,  # (B,Ts,H,W,3) uint8
+                "tcp_state": robot_states_B_T_D,  # (B,Ts,D) float32, not used
+                "num_camera_views": 2,
+            }
+            # Older robokit releases exposed max_cache_action on the request;
+            # newer releases moved this contract to the /init response.
+            if "max_cache_action" in inspect.signature(
+                    StepRequestFromEvaluator.encode_from_raw
+            ).parameters:
+                encode_kwargs["max_cache_action"] = self.send_per_frames
+            request_to_policy = StepRequestFromEvaluator.encode_from_raw(**encode_kwargs)
 
             # print(f"[LiberoForceSocketEvaluator] sending frames, i={self.send_cnt}, per={self.send_per_frames}, "
             #       f"i%per={self.send_cnt % self.send_per_frames}, video_B_v2_H_W_C:{video_B_v2_H_W_C.shape}, ")
             sending_dict = request_to_policy.model_dump(mode="json")
+            if self.interface == "fdp":
+                if fdp_state is None:
+                    raise ValueError("fdp interface requires fdp_state")
+                # Keep the original robokit payload intact for compatibility;
+                # the new fdp service consumes this explicit causal state.
+                sending_dict["fdp_state"] = fdp_state
             response = self.http_session.post(
                 f"{self.policy_url}/step",
                 json=sending_dict
             )
-            response.raise_for_status()
+            if not response.ok:
+                # Include the policy-side diagnostic; a bare HTTP status makes
+                # malformed state/image payloads unnecessarily hard to debug.
+                detail = getattr(response, "text", "")
+                raise RuntimeError(
+                    f"policy request failed ({response.status_code}): {detail[:2000]}"
+                )
 
             response = response.json()
-            raw_actions = StepRequestFromPolicy(action=response["action"]).decode_to_raw()["action"]  # (B,H,7)
+            if not isinstance(response, dict) or "action" not in response:
+                raise RuntimeError("policy response must contain an action field")
+            raw_actions = StepRequestFromPolicy(action=response["action"]).decode_to_raw()["action"]  # (B,H,D)
+            if (raw_actions.ndim != 3 or raw_actions.shape[0] != 1
+                    or raw_actions.shape[1] < 1 or raw_actions.shape[2] < 1
+                    or not np.isfinite(raw_actions).all()):
+                raise RuntimeError(f"policy returned invalid action shape {raw_actions.shape}")
+            if response.get("max_cache_action") is not None:
+                self._set_cache_horizon(response["max_cache_action"])
+            if self.interface == "fdp":
+                future_wrench = response.get("future_wrench")
+                future_offsets = response.get("future_wrench_offsets_s")
+                if future_wrench is None or future_offsets is None:
+                    self.latest_future_wrench = None
+                    self.latest_future_offsets_s = None
+                    self.latest_prediction_timestamp_s = None
+                else:
+                    future_wrench = np.asarray(future_wrench, dtype=np.float32)
+                    future_offsets = np.asarray(future_offsets, dtype=np.float64).reshape(-1)
+                    if (future_wrench.ndim != 2 or future_wrench.shape[1] != 6
+                            or future_wrench.shape[0] != future_offsets.size
+                            or future_wrench.shape[0] < 1
+                            or not np.isfinite(future_wrench).all()
+                            or not np.isfinite(future_offsets).all()
+                            or np.any(future_offsets < 0)
+                            or np.any(np.diff(future_offsets) <= 0)):
+                        raise RuntimeError(
+                            "FDP returned an invalid future_wrench forecast"
+                        )
+                    self.latest_future_wrench = future_wrench
+                    self.latest_future_offsets_s = future_offsets
+                    self.latest_prediction_timestamp_s = (
+                        None if fdp_state is None else float(fdp_state["timestamp_s"])
+                    )
+                    self.latest_prediction_updated = True
+            # A server may advertise a larger cache than the returned chunk;
+            # never index beyond the actual response horizon.
+            self.send_per_frames = min(self.send_per_frames, int(raw_actions.shape[1]))
 
             # assert raw_actions.shape[0] == self.send_per_frames
             self.cache_actions_B_T_D = raw_actions
@@ -429,6 +1208,7 @@ class LiberoForceSocketEvaluator:
         domain_shift_str = "+".join(domain_shift_tags) if domain_shift_tags else "none"
 
         env = self.env
+        env.start_terminal_listener()
         env.reset_env()
 
         self.send_reset()
@@ -445,10 +1225,27 @@ class LiberoForceSocketEvaluator:
             ## You need to make sure this is correct for your policy.
             # self.send_reset()
             self.current_test_id = test_idx
-            _ = env.reset_to_benchmark_init(
-                init_state_id=test_idx,
-                env_seed=test_seed
-            )
+            stage_flag = 0  # each episode starts cold after a policy reset
+            # FDPInference enforces a monotonic native-rate timestamp.  Each
+            # benchmark initial state is a separate rollout, so reset the
+            # stateful FDP service at every episode boundary before sending the
+            # first frame of the new rollout.
+            if self.interface == "fdp":
+                self.send_reset()
+            dataset_state = None
+            if self.dataset_initial_states:
+                dataset_index = test_idx % len(self.dataset_initial_states)
+                dataset_state = self.dataset_initial_states[dataset_index]
+                dataset_model_file = self.dataset_initial_model_files[dataset_index]
+                _ = env.reset_to_dataset_init(
+                    dataset_state, model_file=dataset_model_file, env_seed=test_seed
+                )
+                print(f"[DEBUG] initial scene source: HDF5 demo_{dataset_index}")
+            else:
+                _ = env.reset_to_benchmark_init(
+                    init_state_id=test_idx,
+                    env_seed=test_seed
+                )
 
             # add visual randomization here if needed
             visual_info = None
@@ -466,9 +1263,12 @@ class LiberoForceSocketEvaluator:
                 # texture reset rebuilds env internals; restore benchmark init state
                 # without calling env.reset() again (which may overwrite patched XML).
                 if visual_info.get("reset_applied", False):
-                    env.set_benchmark_init_without_reset(
-                        init_state_id=test_idx,
-                    )
+                    if dataset_state is not None:
+                        env.set_dataset_state_without_reset(
+                            dataset_state, model_file=dataset_model_file
+                        )
+                    else:
+                        env.set_benchmark_init_without_reset(init_state_id=test_idx)
 
             # add physics randomization here if needed
             if friction_scale != 1.0 or gz_scale != 1.0 or solref_scale != 1.0:
@@ -522,6 +1322,10 @@ class LiberoForceSocketEvaluator:
             )
             obs = env.regenerate_obs_from_current_state()
 
+            if not env.wait_for_inference_start():
+                print("[interactive] input/viewer closed; stopping evaluation", flush=True)
+                break
+
             env_name = env.task_name
             cur_sr = float(np.array(eval_results['success_list']).mean()) * 100. if len(
                 eval_results['success_list']) > 0 else 0.0
@@ -539,6 +1343,42 @@ class LiberoForceSocketEvaluator:
 
             # b) start rollout
             while not done:
+                if env.consume_reset_request():
+                    # The evaluator thread owns both the simulator and policy
+                    # session.  Reset to the same demo initial state, then wait
+                    # for the next s command before sending another action.
+                    pbar.close()
+                    self.send_reset()
+                    stage_flag = 0
+                    if dataset_state is not None:
+                        obs = env.reset_to_dataset_init(
+                            dataset_state, model_file=dataset_model_file, env_seed=test_seed
+                        )
+                    else:
+                        obs = env.reset_to_benchmark_init(
+                            init_state_id=test_idx,
+                            env_seed=test_seed,
+                        )
+                    if use_dynamic_color_light:
+                        env.visual_helper.capture_dynamic_light_base(model=env.env.sim.model)
+                        env.visual_helper.apply_dynamic_rainbow_light(
+                            model=env.env.sim.model,
+                            step_idx=1,
+                        )
+                        env.env.sim.forward()
+                    vis_frames = []
+                    vis_forces = []
+                    done = False
+                    success = False
+                    pbar = tqdm(
+                        total=self.test_max_steps,
+                        desc=f"Eval {env_name[:20]} ({test_idx+1}/{self.test_cnt}) (reset)",
+                        leave=False,
+                    )
+                    if not env.wait_for_inference_start():
+                        done = True
+                        break
+                    continue
                 np_obs_dict = dict(obs)
                 '''
                 [DEBUG] 1st obs::                                    
@@ -597,6 +1437,12 @@ class LiberoForceSocketEvaluator:
                 cur_primary_rgb = np_obs_dict["agentview_image"]  # (H,W,C) uint8
                 cur_gripper_rgb = np_obs_dict["robot0_eye_in_hand_image"]  # (H,W,C) uint8
                 cur_joint_state = latest_robot_states_B_T_D[0, 0]  # (6+6) with force
+                fdp_state = None
+                if self.interface == "fdp":
+                    fdp_state = env.fdp_state(
+                        obs,
+                        timestamp_s=float(env.step_cnt) * env.control_timestep,
+                    )
 
                 # work like a queue, only keep the latest `buffer_size` frames
                 buffer_size = self.send_per_frames
@@ -642,7 +1488,20 @@ class LiberoForceSocketEvaluator:
                         image_B_T_H_W_C=gt_video,  # (B,V*Ts,H,W,C) uint8
                         stage_flag=stage_flag,
                         robot_states_B_T_D=cur_joint_state[None, :],  # (B,Ts,6+6)
+                        fdp_state=fdp_state,
                     )
+                    if (
+                        self.interface == "fdp"
+                        and self.latest_prediction_updated
+                        and self.latest_prediction_timestamp_s is not None
+                        and self.latest_future_offsets_s is not None
+                        and self.latest_future_wrench is not None
+                    ):
+                        env.record_wrench_prediction(
+                            self.latest_prediction_timestamp_s,
+                            self.latest_future_offsets_s,
+                            self.latest_future_wrench,
+                        )
                     # print("[DEBUG] out_action_B_1_D:", out_action_B_1_D.shape, out_action_B_1_D.dtype, out_action_B_1_D.min(), out_action_B_1_D.max())
                     action_dict = {
                         "action": torch.from_numpy(out_action_B_1_D).to(device=device),  # (B,1,2)
@@ -723,6 +1582,7 @@ class LiberoForceSocketEvaluator:
 
             if friction_scale != 1.0 or gz_scale != 1.0 or solref_scale != 1.0:
                 env.restore_physics()
+            env.clear_inference_start()
             test_seed += 1
 
         # clear out video buffer

@@ -18,9 +18,14 @@ def load_config(path=DEFAULT_CONFIG):
     root = (path.parent / Path(config.get("project_root", ".")).expanduser()).resolve()
     for section, keys in {"dp": ("repo", "checkpoint", "backbone"),
                           "cad_wm": ("repo", "checkpoint", "train_config"),
+                          "student": ("repo", "checkpoint"),
                           "replay": ("dataset", "output")}.items():
+        section_config = config.get(section) or {}
+        if not isinstance(section_config, dict):
+            raise ValueError(f"Inference config section {section!r} must be a mapping")
+        config[section] = section_config
         for key in keys:
-            value = config.get(section, {}).get(key)
+            value = section_config.get(key)
             if value is not None:
                 config[section][key] = str((root / Path(value).expanduser()).resolve())
     return config
@@ -33,7 +38,8 @@ def check_config(config):
     checkpoint = Path(config["dp"]["checkpoint"])
     saved = checkpoint.parent.parent / ".hydra/config.yaml"
     dp = OmegaConf.load(saved)
-    OmegaConf.resolve(dp)
+    # Resolve only the fields below. Training-only logging paths can contain
+    # Hydra's ${now:...}, which is unavailable in this standalone CLI.
     wm = yaml.safe_load(Path(config["cad_wm"]["train_config"]).read_text())
     dataset = dp.task.dataset
     dt = float(dataset.timestamp_step_sec)
@@ -53,8 +59,10 @@ def check_config(config):
             "sample_rate_hz": 1 / dt, "observation_steps": int(dp.n_obs_steps),
             "cad_wm_history_steps": int(wm["dataloader"]["state_history_horizon"]),
             "future_wrench_offsets_s": offsets,
-            "action_format": "absolute_ee_pose_xyz_xyzw", "action_shape": [int(dp.n_action_steps), 7],
+            "action_format": "absolute_ee_pose_xyz_xyzw" + ("_gripper_command" if int(dp.shape_meta.action.shape[0]) == 8 else ""),
+            "action_shape": [int(dp.n_action_steps), int(dp.shape_meta.action.shape[0])],
             "phase_wrench_source": config["runtime"]["phase_wrench_source"],
+            "future_contact_mode": config["runtime"].get("future_contact_mode", "checkpoint"),
             "lstm_layers": int(dp.policy.force_encoder_layers),
             "cross_attention_query": str(dp.policy.cross_attn_query),
             "cross_attention_layers": int(dp.policy.cross_attn_layers),

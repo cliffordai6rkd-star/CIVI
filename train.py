@@ -36,9 +36,16 @@ Notes:
 
 import sys
 import inspect
-# use line-buffering for both stdout and stderr
-sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
-sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1)   
+
+# Keep CLI logs line-buffered without replacing the underlying file
+# descriptors.  Reopening fd 1/2 at import time breaks pytest capture (and
+# callers embedding the training module) because the capture-owned descriptors
+# are closed while the new streams remain installed globally.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(line_buffering=True)
+    except (AttributeError, OSError, ValueError):
+        pass
 
 import hydra
 import torch

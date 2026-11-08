@@ -27,8 +27,9 @@ class FakePolicy(torch.nn.Module):
     n_action_steps = 8
     action_start_index = 1
 
-    def __init__(self):
+    def __init__(self, action_dim=7):
         super().__init__()
+        self.action_dim = action_dim
         self.weight = torch.nn.Parameter(torch.zeros(()))
         self.last_obs = None
 
@@ -38,9 +39,11 @@ class FakePolicy(torch.nn.Module):
     def predict_action(self, obs, generator):
         assert not self.training and not torch.is_grad_enabled()
         self.last_obs = {key: value.clone() for key, value in obs.items()}
-        action = torch.zeros((1, 8, 7))
+        action = torch.zeros((1, 8, self.action_dim))
         action[..., :3] = torch.randn((1, 8, 3), generator=generator)
         action[..., 6] = 1
+        if self.action_dim == 8:
+            action[..., 7] = -1
         return {"action": action}
 
 
@@ -60,18 +63,22 @@ class FakeWM:
         return np.broadcast_to((latest + np.arange(1, 9))[:, None], (8, 6)).copy()
 
 
-def dp_config():
+def dp_config(action_dim=7):
     shapes = {camera: {"shape": [3, 16, 16], "type": "rgb"} for camera in ("side", "wrist")}
     shapes.update({key: {"shape": [8, 6], "type": "low_dim"} for key in ("wrench", "future_wrench")})
-    return OmegaConf.create({
+    config = OmegaConf.create({
         "policy": {"relative_pose_actions": False},
-        "shape_meta": {"obs": shapes, "action": {"shape": [7]}},
+        "shape_meta": {"obs": shapes, "action": {"shape": [action_dim]}},
         "task": {"dataset": {"timestamp_step_sec": 0.05, "action_feature_fields": ["observation.ee_pose"],
                              "windowed_lowdim_feature_groups": {
                                  "wrench": {"start_offset": -7, "stride": 1},
                                  "future_wrench": {"offsets_sec": (np.arange(1, 9) / 20).tolist()},
                              }}},
     })
+    if action_dim == 8:
+        config.task.dataset.action_feature_fields = ["observation.ee_pose", "action"]
+        config.task.dataset.action_feature_columns = {"action": [6]}
+    return config
 
 
 def engine(**kwargs):
@@ -95,6 +102,16 @@ def test_base_is_abstract_and_fdp_obeys_shared_api():
     assert "wrench" not in model.spec.required_fields
     with pytest.raises(RuntimeError, match="before predicting"):
         model.predict()
+
+
+def test_eight_dimensional_teacher_returns_pose_and_preserves_gripper_command():
+    model = FDPInference(policy=FakePolicy(8), dp_config=dp_config(8), wrench_provider=FakeWM())
+    for frame in range(3):
+        result = model(observation(frame))
+    assert result.ready and result.actions.shape == (8, 8)
+    assert result.action_format == "absolute_ee_pose_xyz_xyzw_gripper_command"
+    np.testing.assert_array_equal(result.actions[:, 7], -np.ones(8))
+    np.testing.assert_allclose(np.linalg.norm(result.actions[:, 3:7], axis=-1), 1)
 
 
 def test_causal_forecasts_are_cached_per_image_anchor_and_phase_uses_previous_prediction():
@@ -143,6 +160,13 @@ def test_optional_measured_phase_does_not_replace_cad_future():
     obs = model.policy.last_obs
     np.testing.assert_array_equal(obs["wrench"][0, 0], np.full((8, 6), 100))
     np.testing.assert_array_equal(obs["future_wrench"][0, 0, :, 0], np.arange(1, 9))
+
+
+def test_runtime_future_contact_mode_override_is_validated_without_touching_sampling():
+    model = engine(phase_wrench_source="measured", future_contact_mode="legacy_rollout")
+    assert model.future_contact_mode == "legacy_rollout"
+    with pytest.raises(ValueError, match="future_contact_mode"):
+        engine(future_contact_mode="invalid")
 
 
 def test_timestamp_gaps_duplicates_and_episode_reuse_are_rejected_without_consuming_state():
@@ -239,16 +263,21 @@ def test_config_paths_are_anchored_to_config_file_not_cwd(tmp_path, monkeypatch)
     monkeypatch.chdir(tmp_path)
     cfg = load_config(DEFAULT_CONFIG)
     assert Path(cfg["dp"]["repo"]) == PROJECT_ROOT.parent / "dp_hirol_main"
-    assert cfg["cad_wm"]["checkpoint"] is None
+    assert Path(cfg["cad_wm"]["checkpoint"]) == PROJECT_ROOT / "cad-wm/outputs/cad_wm_median3_200k/checkpoints/step_00180000.pt"
+    cfg["cad_wm"]["checkpoint"] = None
+    missing_wm = tmp_path / "missing_wm.yaml"
+    missing_wm.write_text(yaml.safe_dump(cfg))
     with pytest.raises(ValueError, match="cad_wm.checkpoint"):
-        FDPInference.from_config(DEFAULT_CONFIG)
+        FDPInference.from_config(missing_wm)
 
 
 def test_config_check_can_compare_training_contracts_before_wm_training(tmp_path):
     cfg = load_config()
+    cfg["cad_wm"]["checkpoint"] = None
     teacher_cfg = dp_config()
     teacher_cfg.n_obs_steps = 2
     teacher_cfg.n_action_steps = 8
+    teacher_cfg.logging = {"name": "${now:%Y.%m.%d-%H.%M.%S}_teacher"}
     teacher_cfg.policy.update(wrench_key="future_wrench", force_encoder_layers=2,
                               cross_attn_query="image", cross_attn_layers=1)
     teacher_run = tmp_path / "teacher"

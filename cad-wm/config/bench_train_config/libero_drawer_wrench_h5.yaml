@@ -34,7 +34,8 @@ contact_gate:
   contact_threshold: 8.0
   contact_enter_frames: 5
   contact_exit_frames: 5
-  # DP semantics: strict > enters, strict < exits, no backfill; equality holds state.
+  # Offline labels: strict > enters, strict < exits; equality holds state.
+  # Confirmed entry/exit windows are backfilled to their first native frame.
   # Confirmation counts native H5 frames (5 frames = 0.25 s at 20 Hz).
   precontact_seconds: 1.0
   class_weights: [1.0, 1.0, 1.0]
