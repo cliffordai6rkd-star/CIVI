@@ -522,3 +522,144 @@ class WrenchLivePlot:
 
     def _handle_close(self, event) -> None:
         self._closed = True
+
+
+class CameraLiveView:
+    """Show the exact RGB frames sent to FDP and a flip-ud diagnostic.
+
+    MuJoCo/robosuite camera buffers are often vertically inverted in saved
+    human-facing videos.  The evaluator must keep the model input unchanged,
+    so this window labels the raw FDP input separately from a non-input
+    ``flipud`` preview.  Seeing both at the same timestamp makes an orientation
+    mismatch observable without silently changing the policy stream.
+    """
+
+    def __init__(
+        self,
+        title: str = "FDP camera input",
+        backend: str | None = None,
+        *,
+        allow_headless: bool = False,
+    ) -> None:
+        self.figure = None
+        self._plt = None
+        self._closed = False
+        self._images = [None, None]
+        self._axes = []
+        self._artists = []
+        self._status = None
+
+        import matplotlib
+
+        try:
+            if backend is not None:
+                matplotlib.use(backend)
+            from matplotlib import pyplot as plt
+
+            self._plt = plt
+            selected_backend = str(matplotlib.get_backend())
+            if not allow_headless and not WrenchReplayPlot._is_interactive_backend(
+                selected_backend
+            ):
+                raise RuntimeError(
+                    f"Matplotlib backend {selected_backend!r} cannot open an interactive "
+                    "camera window. Select a GUI backend such as TkAgg."
+                )
+            self.figure, axes = plt.subplots(2, 2, figsize=(10, 7))
+            self._axes = list(np.asarray(axes).reshape(-1))
+            labels = (
+                "FDP input: side / agentview_image",
+                "FDP input: wrist / robot0_eye_in_hand_image",
+                "flipud diagnostic: side (not sent)",
+                "flipud diagnostic: wrist (not sent)",
+            )
+            for axis, label in zip(self._axes, labels):
+                axis.set_title(label, fontsize=10)
+                axis.axis("off")
+                self._artists.append(axis.imshow(np.zeros((2, 2, 3), dtype=np.uint8)))
+            self.figure.suptitle(title)
+            manager = self.figure.canvas.manager
+            if manager is not None:
+                manager.set_window_title(title)
+            self._status = self.figure.text(
+                0.5, 0.01, "waiting for MuJoCo frames", ha="center", va="bottom", fontsize=10
+            )
+            self.figure.tight_layout(rect=(0, 0.03, 1, 0.96))
+            self.figure.canvas.mpl_connect("close_event", self._handle_close)
+            if not allow_headless:
+                plt.show(block=False)
+                self.pump()
+        except Exception as exc:
+            if self.figure is not None and self._plt is not None:
+                self._plt.close(self.figure)
+            self._closed = True
+            raise RuntimeError(
+                "Could not open the interactive camera window. "
+                "Use a GUI backend such as TkAgg with a working desktop display. "
+                f"Details: {exc}"
+            ) from exc
+
+    @property
+    def is_open(self) -> bool:
+        return bool(
+            not self._closed
+            and self.figure is not None
+            and self._plt is not None
+            and self._plt.fignum_exists(self.figure.number)
+        )
+
+    @staticmethod
+    def _validate_image(image, name: str) -> np.ndarray:
+        value = np.asarray(image)
+        if value.ndim != 3 or value.shape[-1] != 3:
+            raise ValueError(f"{name} must have shape [H, W, 3], got {value.shape}")
+        if not np.issubdtype(value.dtype, np.number) or not np.isfinite(value).all():
+            raise ValueError(f"{name} must contain finite RGB values")
+        if value.min() < 0 or value.max() > 255:
+            raise ValueError(f"{name} RGB values must be in [0, 255]")
+        return np.ascontiguousarray(value, dtype=np.uint8)
+
+    def update(self, timestamp: float, side_image, wrist_image) -> None:
+        """Display the raw frames used for FDP plus vertically flipped previews."""
+        timestamp_array = np.asarray(timestamp)
+        if timestamp_array.ndim != 0 or not np.isfinite(float(timestamp)):
+            raise ValueError("timestamp must be a finite scalar")
+        side = self._validate_image(side_image, "side_image")
+        wrist = self._validate_image(wrist_image, "wrist_image")
+        if side.shape != wrist.shape:
+            raise ValueError(
+                f"side and wrist images must have identical shapes, got {side.shape} and {wrist.shape}"
+            )
+        self._images = [side.copy(), wrist.copy()]
+        if not self.is_open:
+            return
+        frames = (side, wrist, np.flipud(side).copy(), np.flipud(wrist).copy())
+        for artist, frame in zip(self._artists, frames):
+            artist.set_data(frame)
+        self._status.set_text(
+            f"t = {float(timestamp):.3f} s | raw panels are exactly the FDP input; "
+            "bottom panels are flipud diagnostics"
+        )
+        self.figure.canvas.draw_idle()
+        self.pump()
+
+    def reset(self) -> None:
+        self._images = [None, None]
+        if not self.is_open:
+            return
+        for artist in self._artists:
+            artist.set_data(np.zeros((2, 2, 3), dtype=np.uint8))
+        self._status.set_text("waiting for MuJoCo frames")
+        self.figure.canvas.draw_idle()
+
+    def pump(self) -> None:
+        if self.is_open:
+            self.figure.canvas.flush_events()
+
+    def close(self) -> None:
+        if self.figure is not None and self._plt is not None and not self._closed:
+            self._closed = True
+            self._plt.close(self.figure)
+
+    def _handle_close(self, event) -> None:
+        self._closed = True

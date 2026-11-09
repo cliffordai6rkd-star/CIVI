@@ -29,10 +29,25 @@ runtime:
   # measured: current measured wrench is used for phase history.
   # Future network wrench always comes from CAD-WM in either mode.
   phase_wrench_source: measured
-  # The checkpoint was trained with token_threshold.  At deployment the
-  # CAD-WM forecast is stochastic, so use its existing causal hysteresis
-  # rollout to avoid toggling the image-only/fused branch at 8 N.
-  future_contact_mode: legacy_rollout
+  # Physical-unit, episode-local low-pass before teacher contact processing.
+  # This older teacher did not enable the Dataset filter during training.
+  wrench_filter:
+    enabled: false
+    cutoff_hz: 2.0
+  # Match the teacher checkpoint's original per-token future preprocessing.
+  future_contact_mode: token_threshold
+  # Confirm contact across consecutive sensor frames, matching overlapping
+  # forecast times. Close immediately on a free forecast to avoid stale input.
+  # At 20 Hz, two matching frames add 50 ms of confirmation delay.
+  future_contact_stabilization:
+    enabled: true
+    enter_frames: 2
+    exit_frames: 1
+  # Print each raw CAD-WM force-norm chunk and the corresponding DP input chunk.
+  print_wrench_chunks: true
+  # DP action index 0 is the current observation anchor; execute the next
+  # native-rate target so the online controller advances through the trajectory.
+  execution_action_index: 1
 
 # Optional offline replay: uses only images and histories ending at each row.
 # It emits pose predictions; it does not step a simulator or execute a robot.

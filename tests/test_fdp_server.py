@@ -94,6 +94,57 @@ def test_service_requires_measured_wrench_when_configured(monkeypatch):
         service.step(payload)
 
 
+def test_service_executes_next_action_after_current_anchor(monkeypatch):
+    class FakeResult:
+        ready = True
+        actions = np.asarray(
+            [
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, -1.0],
+                [0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+        info = {"future_wrench": None, "future_wrench_offsets_s": None}
+
+    class FakeEngine:
+        phase_wrench_source = "cad_wm"
+        dt = 0.05
+
+        def predict(self, observation):
+            return FakeResult()
+
+    service = object.__new__(FDPService)
+    service.engine = FakeEngine()
+    service.seed = 42
+    service.lock = threading.RLock()
+    service.frame_index = 0
+    service.initialized = True
+    service.execution_action_index = 1
+    monkeypatch.setattr(
+        fdp_server,
+        "_decode_video",
+        lambda payload: [np.zeros((8, 8, 3), dtype=np.uint8)] * 2,
+    )
+    payload = {
+        "gt_video": [["ignored", "ignored"]],
+        "fdp_state": {
+            "q": [0.0] * 7,
+            "dq": [0.0] * 7,
+            "tau": [0.0] * 7,
+            "eef_pos": [0.0] * 3,
+            "eef_quat": [0.0, 0.0, 0.0, 1.0],
+        },
+    }
+
+    response = service.step(payload)
+    np.testing.assert_allclose(
+        np.asarray(response["action"], dtype=np.float32)[0, 0],
+        [0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+    )
+    assert response["execution_action_index"] == 1
+    np.testing.assert_allclose(response["predicted_delta_pos"], [0.01, 0.0, 0.0])
+
+
 def test_service_returns_cad_wm_future_wrench_for_live_visualization(monkeypatch):
     class FakeResult:
         ready = False
@@ -102,6 +153,9 @@ def test_service_returns_cad_wm_future_wrench_for_live_visualization(monkeypatch
             "future_wrench": np.arange(48, dtype=np.float32).reshape(8, 6),
             "future_wrench_offsets_s": np.arange(1, 9, dtype=np.float64) / 20.0,
             "future_contact_mode": "legacy_rollout",
+            "raw_future_has_contact": [False, True],
+            "future_contact_gate": [False, False],
+            "contact_wrench_held": [False, False],
         }
 
     class FakeEngine:
@@ -142,3 +196,6 @@ def test_service_returns_cad_wm_future_wrench_for_live_visualization(monkeypatch
         response["future_wrench_offsets_s"], FakeResult.info["future_wrench_offsets_s"]
     )
     assert response["future_contact_mode"] == "legacy_rollout"
+    for key in ("raw_future_has_contact", "future_contact_gate", "contact_wrench_held"):
+        assert response[key] == FakeResult.info[key]
+    assert response["predicted_delta_pos"] is None

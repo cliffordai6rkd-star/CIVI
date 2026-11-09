@@ -5,6 +5,8 @@ from pathlib import Path
 import numpy as np
 import yaml
 
+from .wrench_filter import resolve_wrench_filter
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = PROJECT_ROOT / "configs/inference/fdp_cad_wm.yaml"
@@ -52,6 +54,12 @@ def check_config(config):
     if list(wm["model"]["inputs"]) != ["q", "dq", "tau"] or list(wm["model"]["outputs"]) != ["wrench"]:
         raise ValueError("CAD-WM must use q/dq/tau -> wrench")
     wm_checkpoint = config["cad_wm"].get("checkpoint")
+    wrench_filter = resolve_wrench_filter(config["runtime"].get("wrench_filter"))
+    training_filter = resolve_wrench_filter(dataset.get("wrench_filter"))
+    training_filter.pop("apply_to_future") # Runtime switch, not a Dataset parameter.
+    filter_matches = (wrench_filter["enabled"] == training_filter["enabled"] and
+                      (not wrench_filter["enabled"] or
+                       np.isclose(wrench_filter["cutoff_hz"], training_filter["cutoff_hz"])))
     return {"dp_checkpoint": str(checkpoint), "dp_checkpoint_exists": checkpoint.is_file(),
             "cad_wm_checkpoint": wm_checkpoint,
             "cad_wm_checkpoint_exists": bool(wm_checkpoint and Path(wm_checkpoint).is_file()),
@@ -62,7 +70,12 @@ def check_config(config):
             "action_format": "absolute_ee_pose_xyz_xyzw" + ("_gripper_command" if int(dp.shape_meta.action.shape[0]) == 8 else ""),
             "action_shape": [int(dp.n_action_steps), int(dp.shape_meta.action.shape[0])],
             "phase_wrench_source": config["runtime"]["phase_wrench_source"],
-            "future_contact_mode": config["runtime"].get("future_contact_mode", "checkpoint"),
+            "future_contact_mode": (config["runtime"].get("future_contact_mode") or
+                                    str(dp.policy.get("future_contact_mode", "legacy_rollout"))),
+            "wrench_filter": wrench_filter,
+            "training_wrench_filter": training_filter,
+            "wrench_filter_matches_training": bool(filter_matches),
+            "future_contact_stabilization": config["runtime"].get("future_contact_stabilization", {"enabled": False}),
             "lstm_layers": int(dp.policy.force_encoder_layers),
             "cross_attention_query": str(dp.policy.cross_attn_query),
             "cross_attention_layers": int(dp.policy.cross_attn_layers),

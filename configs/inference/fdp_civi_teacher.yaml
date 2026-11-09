@@ -1,0 +1,55 @@
+# Paths resolve relative to project_root, regardless of the launch directory.
+project_root: ../..
+
+dp:
+  repo: ../dp_hirol_main
+  checkpoint: ../dp_hirol_main/data/outputs/civi/teacher/checkpoints/optimizer_step=00180000-action_mse=0.00967494.ckpt
+  backbone: ../dp_hirol_main/model/model/dinov3-vitb16-pretrain-lvd1689m
+  state_key: ema_model
+  diffusion_steps: null
+
+cad_wm:
+  repo: ../dp_hirol_main/cad-wm
+  train_config: ../dp_hirol_main/cad-wm/config/bench_train_config/libero_drawer_wrench_h5_portable.yaml
+  checkpoint: ../dp_hirol_main/cad-wm/outputs/cad_wm_lowpass2hz/checkpoints/step_00200000.pt
+  device: null
+  steps: null
+  solver: null
+
+runtime:
+  device: cpu # Set cuda:0 when CUDA is available.
+  seed: 42
+  amp_enabled: true # Used only on CUDA.
+  amp_dtype: bfloat16
+  timing_tolerance_s: 0.001
+  phase_wrench_source: measured
+  # Match the teacher Dataset: causal first-order filter on all six channels.
+  # Filter the measured stream once per frame. CAD-WM was trained on the same
+  # 2 Hz filtered targets, so its forecasts must not be low-passed again.
+  wrench_filter:
+    enabled: true
+    cutoff_hz: 2.0
+    apply_to_future: false
+  future_contact_mode: null # Restore legacy_rollout from this checkpoint.
+  future_contact_stabilization:
+    enabled: false
+  print_wrench_chunks: true
+  execution_action_index: 1
+
+replay:
+  dataset: dataset/wm_data/KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet_and_put_the_bowl_in_it_demo_wrench_with_dq_tau.hdf5
+  demo: demo_0
+  start_frame: 0
+  max_frames: 100
+  predict_every: 1
+  output: outputs/inference/fdp_civi_teacher_180k_wm_lowpass2hz_200k_demo_0.npz
+  fields:
+    timestamp: states
+    q: obs/joint_states
+    dq: obs/dq
+    tau: obs/tau
+    joint_columns: [0, 1, 2, 3, 4, 5, 6]
+    cameras:
+      wrist: obs/eye_in_hand_rgb
+      side: obs/agentview_rgb
+    wrench: obs/wrenches

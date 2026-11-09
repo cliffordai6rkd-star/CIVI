@@ -10,8 +10,10 @@ from PIL import Image
 import torch
 
 from .cad_wm_provider import CADWMWrenchProvider
+from .contact_stabilizer import FutureContactStabilizer
 from .config import load_config
 from .inference_base import InferenceBase, InferenceObservation, InferenceResult, InferenceSpec
+from .wrench_filter import lowpass_wrench, resolve_wrench_filter
 
 
 def load_dp(config, device):
@@ -117,22 +119,31 @@ class FDPInference(InferenceBase):
         instance = cls(policy=policy, dp_config=dp_config, wrench_provider=wm,
                        device=device, phase_wrench_source=runtime["phase_wrench_source"],
                        future_contact_mode=runtime.get("future_contact_mode"),
+                       future_contact_stabilization=runtime.get("future_contact_stabilization"),
+                       wrench_filter=runtime.get("wrench_filter"),
+                       print_wrench_chunks=runtime.get("print_wrench_chunks", True),
                        seed=runtime["seed"], timing_tolerance_s=runtime["timing_tolerance_s"],
                        amp_enabled=runtime["amp_enabled"], amp_dtype=runtime["amp_dtype"])
         instance.checkpoint_info = {"dp": config["dp"]["checkpoint"], "dp_state_key": state_key,
                                     "cad_wm": config["cad_wm"]["checkpoint"],
-                                    "future_contact_mode": instance.future_contact_mode}
+                                    "future_contact_mode": instance.future_contact_mode,
+                                    "wrench_filter": instance.wrench_filter.copy(),
+                                    "future_contact_stabilization": instance.future_contact_stabilization.copy()}
         return instance
 
     def __init__(self, *, policy, dp_config, wrench_provider, device="cpu", seed=42,
                  phase_wrench_source="cad_wm", timing_tolerance_s=0.001,
                  future_contact_mode=None,
+                 future_contact_stabilization=None,
+                 wrench_filter=None,
+                 print_wrench_chunks=True,
                  amp_enabled=True, amp_dtype="bfloat16"):
         self.device = torch.device(device)
         self.policy = policy.to(self.device).eval().requires_grad_(False)
         self.wrench_provider = wrench_provider
         self.seed = int(seed)
         self.phase_wrench_source = phase_wrench_source
+        self.wrench_filter = resolve_wrench_filter(wrench_filter)
         if phase_wrench_source not in {"cad_wm", "measured"}:
             raise ValueError("phase_wrench_source must be cad_wm or measured")
         checkpoint_contact_mode = str(getattr(policy, "future_contact_mode", "legacy_rollout"))
@@ -148,6 +159,7 @@ class FDPInference(InferenceBase):
         self.future_contact_mode = contact_mode
         if hasattr(self.policy, "future_contact_mode"):
             self.policy.future_contact_mode = contact_mode
+        self.print_wrench_chunks = bool(print_wrench_chunks)
         self.timing_tolerance_s = float(timing_tolerance_s)
         self.dt = float(dp_config.task.dataset.timestamp_step_sec)
         if not np.isfinite(self.dt) or self.dt <= 0:
@@ -205,6 +217,25 @@ class FDPInference(InferenceBase):
         if amp_dtype not in {"bfloat16", "float16"}:
             raise ValueError("amp_dtype must be bfloat16 or float16")
         self.amp_dtype = getattr(torch, amp_dtype)
+        stabilization = dict(future_contact_stabilization or {})
+        self.future_contact_stabilization = {
+            "enabled": bool(stabilization.get("enabled", False)),
+            "enter_frames": int(stabilization.get("enter_frames", 2)),
+            "exit_frames": int(stabilization.get("exit_frames", 1)),
+        }
+        self._contact_stabilizer = None
+        if self.future_contact_stabilization["enabled"]:
+            if (self.future_contact_mode != "token_threshold"
+                    or not getattr(policy, "contact_fusion_gate", False)
+                    or policy.future_phase_wrench_key != self.wrench_key):
+                raise ValueError("future contact stabilization requires token_threshold, "
+                                 "contact_fusion_gate and a shared future wrench/phase key")
+            if self.future_contact_stabilization["enter_frames"] > self.future_steps:
+                raise ValueError("future contact enter_frames cannot exceed the forecast horizon")
+            self._contact_stabilizer = FutureContactStabilizer(
+                enter_frames=self.future_contact_stabilization["enter_frames"],
+                exit_frames=self.future_contact_stabilization["exit_frames"],
+            )
         self.checkpoint_info = {}
         self.reset()
 
@@ -228,9 +259,74 @@ class FDPInference(InferenceBase):
         self._last_timestamp = None
         self._previous_future = None
         self._latest_future = None
+        self._latest_policy_future = None
+        self._filtered_phase = None
+        if self._contact_stabilizer is not None:
+            self._contact_stabilizer.reset()
         self._frames_seen = 0
+        self._last_wrench_log_frame = -1
         self._warmup_reason = "waiting_for_observation"
         self.policy.reset()
+
+    @staticmethod
+    def _force_norm_chunk(value, *, latest_context: bool = False):
+        """Return per-token L2 norms of the first three wrench channels."""
+        if torch.is_tensor(value):
+            value = value.detach().float().cpu().numpy()
+        value = np.asarray(value, dtype=np.float32)
+        if latest_context:
+            if value.ndim != 4 or value.shape[0] < 1 or value.shape[1] < 1:
+                raise ValueError(
+                    f"processed wrench must have shape [B, To, K, 6], got {value.shape}"
+                )
+            value = value[0, -1]
+        if value.ndim != 2 or value.shape[1] != 6:
+            raise ValueError(f"wrench chunk must have shape [K, 6], got {value.shape}")
+        if not np.isfinite(value).all():
+            raise ValueError("wrench chunk contains non-finite values")
+        return np.linalg.norm(value[:, :3], axis=-1)
+
+    @staticmethod
+    def _format_force_norms(values):
+        return np.array2string(
+            np.asarray(values, dtype=np.float32),
+            precision=3,
+            separator=", ",
+            suppress_small=False,
+        )
+
+    def _print_wrench_diagnostic(self, timestamp: float, *, ready: bool) -> None:
+        """Print raw WM and post-preprocessing DP force norms once per WM call."""
+        if not self.print_wrench_chunks or self._latest_future is None:
+            return
+        if self._last_wrench_log_frame == self._frames_seen:
+            return
+        raw_norm = self._force_norm_chunk(self._latest_future)
+        processed = getattr(self.policy, "_latest_processed_wrench", None)
+        normalized = getattr(self.policy, "_latest_normalized_wrench", None)
+        message = (
+            f"[FDP wrench] frame={self._frames_seen} t={float(timestamp):.3f} s | "
+            f"WM raw |F_xyz| [N] = {self._format_force_norms(raw_norm)}"
+        )
+        if processed is None or normalized is None or not ready:
+            message += " | DP input = warmup (not prepared)"
+        else:
+            processed_norm = self._force_norm_chunk(processed, latest_context=True)
+            normalized_norm = self._force_norm_chunk(normalized, latest_context=True)
+            message += (
+                f" | DP prefix-processed (pre-normalizer) |F_xyz| [N] = "
+                f"{self._format_force_norms(processed_norm)}"
+                f" | DP normalized input |F_xyz| = {self._format_force_norms(normalized_norm)}"
+            )
+        if self._contact_stabilizer is not None:
+            decisions = [row["contact_decision"] for row in self._contexts]
+            message += (
+                f" | contact raw={[row['raw_has_contact'] for row in decisions]}"
+                f" stable={[row['has_contact'] for row in decisions]}"
+                f" held={[row['holding'] for row in decisions]} (oldest->latest)"
+            )
+        print(message, flush=True)
+        self._last_wrench_log_frame = self._frames_seen
 
     @torch.inference_mode()
     def observe(self, observation: InferenceObservation):
@@ -249,27 +345,55 @@ class FDPInference(InferenceBase):
             phase = _vector(observation.wrench, 6, "wrench")
         elif self._previous_future is not None:
             phase = self._previous_future[0].copy()
+        filtered_phase = None
+        if phase is not None and self.wrench_filter["enabled"]:
+            interval = self.dt if self._last_timestamp is None else timestamp - self._last_timestamp
+            filtered_phase = lowpass_wrench(
+                phase[None], [interval], self.wrench_filter["cutoff_hz"], initial=self._filtered_phase,
+            )[0]
+            phase = filtered_phase.astype(np.float32)
         states = [*self._state_history, state][-self.wrench_provider.history_steps:]
         future = None
+        policy_future = None
+        contact_decision = None
         if self.wrench_provider.pad_history or len(states) == self.wrench_provider.history_steps:
             history = {key: np.stack([row[key] for row in states])[None] for key in state}
             future = np.asarray(self.wrench_provider.predict(history), dtype=np.float32)
             if future.shape != (self.future_steps, 6) or not np.isfinite(future).all():
                 raise ValueError(f"CAD-WM must return finite physical wrench [{self.future_steps},6]")
             future = future.copy()
+            policy_future = future.copy()
+            if filtered_phase is not None and self.wrench_filter["apply_to_future"]:
+                # Branch from the current observed state for each forecast.
+                # Predicted samples must never advance the episode's filter.
+                # Disable this when CAD-WM already predicts low-pass targets.
+                policy_future = lowpass_wrench(
+                    future, np.diff(np.r_[0.0, self.future_offsets_s]),
+                    self.wrench_filter["cutoff_hz"], initial=filtered_phase,
+                ).astype(np.float32)
+            if self._contact_stabilizer is not None:
+                # Reuse the checkpoint's physical threshold, channels and norm.
+                # The teacher sees this same filtered chunk for prefix and gate.
+                mask = self.policy.contact_detector.token_contact(
+                    torch.as_tensor(policy_future[None, None], device=self.device)
+                )[0, 0].detach().cpu().numpy()
+                policy_future, contact_decision = self._contact_stabilizer.update(policy_future, mask)
         # Commit the frame only after validating all sensor/model outputs.
         self._state_history.append(state)
         self._last_timestamp = timestamp
         self._frames_seen += 1
         self._previous_future = future
         self._latest_future = future
+        self._latest_policy_future = policy_future
+        self._filtered_phase = filtered_phase
         if phase is not None:
             self._phase_history.append(phase)
         if phase is not None and future is not None:
             rows = list(self._phase_history)
             rows = [rows[0]] * (self.phase_steps - len(rows)) + rows
             self._contexts.append({"images": images, "phase": np.stack(rows),
-                                   "future": future, "timestamp": timestamp})
+                                   "future": future, "policy_future": policy_future,
+                                   "contact_decision": contact_decision, "timestamp": timestamp})
         self._warmup_reason = ("waiting_for_cad_wm_history" if future is None else
                                "waiting_for_current_wrench_forecast" if phase is None else
                                "waiting_for_image_history" if len(self._contexts) < self.observation_steps else None)
@@ -277,7 +401,7 @@ class FDPInference(InferenceBase):
 
     def _policy_observations(self):
         obs = {key: np.stack([row["images"][key] for row in self._contexts])[None] for key in self.image_shapes}
-        obs[self.wrench_key] = np.stack([row["future"] for row in self._contexts])[None]
+        obs[self.wrench_key] = np.stack([row["policy_future"] for row in self._contexts])[None]
         obs[self.phase_key] = np.stack([row["phase"] for row in self._contexts])[None]
         if self.policy.future_phase_wrench_key is not None:
             obs[self.policy.future_phase_wrench_key] = obs[self.wrench_key]
@@ -290,11 +414,22 @@ class FDPInference(InferenceBase):
         if self._last_timestamp is None:
             raise RuntimeError("Call observe() or pass an observation before predicting")
         info = {"wrench_source": "cad_wm", "phase_wrench_source": self.phase_wrench_source,
+                "wrench_filter": self.wrench_filter.copy(),
                 "future_contact_mode": self.future_contact_mode,
                 "frames_seen": self._frames_seen, "warmup_reason": self._warmup_reason,
                 "future_wrench": None if self._latest_future is None else self._latest_future.copy(),
+                "policy_future_wrench": (None if self._latest_policy_future is None
+                                          else self._latest_policy_future.copy()),
                 "future_wrench_offsets_s": self.future_offsets_s.copy(), **self.checkpoint_info}
+        if self._contact_stabilizer is not None:
+            decisions = [row["contact_decision"] for row in self._contexts]
+            info.update(
+                raw_future_has_contact=[row["raw_has_contact"] for row in decisions],
+                future_contact_gate=[row["has_contact"] for row in decisions],
+                contact_wrench_held=[row["holding"] for row in decisions],
+            )
         if self._warmup_reason is not None:
+            self._print_wrench_diagnostic(self._last_timestamp, ready=False)
             return InferenceResult(False, self._last_timestamp, None, None, self.spec.action_format, info)
         autocast = (torch.autocast("cuda", dtype=self.amp_dtype) if self.amp_enabled else contextlib.nullcontext())
         with autocast:
@@ -306,5 +441,6 @@ class FDPInference(InferenceBase):
         if not np.allclose(norms, 1, atol=1e-3, rtol=0):
             raise RuntimeError("FDP returned a non-unit xyzw quaternion")
         info["context_timestamps_s"] = np.array([row["timestamp"] for row in self._contexts])
+        self._print_wrench_diagnostic(self._last_timestamp, ready=True)
         return InferenceResult(True, self._last_timestamp, actions,
                                self._last_timestamp + self.action_offsets_s, self.spec.action_format, info)

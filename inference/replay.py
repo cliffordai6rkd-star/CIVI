@@ -1,6 +1,7 @@
 """Replay recorded sensor frames without using future ground-truth wrench."""
 
 import json
+import copy
 from pathlib import Path
 
 import numpy as np
@@ -56,6 +57,15 @@ def run_replay(engine, config):
     records = []
     frames_seen = 0
     engine.reset()
+    # Preserve the episode's filter and context history when replay starts in
+    # its middle. Only the requested range emits actions and counts as replay.
+    warmup_frames = 0
+    if int(config["replay"]["start_frame"]) > 0:
+        warmup_config = copy.deepcopy(config)
+        warmup_config["replay"].update(start_frame=0, max_frames=int(config["replay"]["start_frame"]))
+        for _, observation in sensor_frames(warmup_config, phase_source=engine.phase_wrench_source):
+            engine.observe(observation)
+            warmup_frames += 1
     for frame, observation in sensor_frames(config, phase_source=engine.phase_wrench_source):
         ready = engine.observe(observation) # WM sees every native-rate frame.
         frames_seen += 1
@@ -76,10 +86,12 @@ def run_replay(engine, config):
             actions=np.stack([result.actions for _, result in records]),
             action_timestamps_s=np.stack([result.action_timestamps_s for _, result in records]),
             future_wrench=np.stack([result.info["future_wrench"] for _, result in records]),
+            policy_future_wrench=np.stack([result.info["policy_future_wrench"] for _, result in records]),
             future_wrench_offsets_s=engine.future_offsets_s,
             action_format=engine.spec.action_format, wrench_source="cad_wm",
         )
     manifest = {"output": str(output), "sensor_frames": frames_seen, "prediction_chunks": len(records),
+                "warmup_sensor_frames": warmup_frames,
                 "action_format": engine.spec.action_format, "action_shape": list(engine.spec.action_shape),
                 "wrench_source": "cad_wm", "phase_wrench_source": engine.phase_wrench_source,
                 "checkpoint_info": engine.checkpoint_info,

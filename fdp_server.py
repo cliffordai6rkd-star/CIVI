@@ -3,7 +3,7 @@
 The simulator evaluator sends two RGB views and the causal q/dq/tau state in
 ``fdp_state``.  The default measured-phase configuration also requires the
 current six-channel ``fdp_state.wrench``.  The teacher itself emits absolute
-xyz+xyzw poses; this service converts the first predicted pose to LIBERO's 7-D
+xyz+xyzw poses; this service converts the selected predicted pose to LIBERO's 7-D
 OSC delta action and returns one action per request.  A standard-library HTTP
 server is used so the model environment does not need FastAPI or robokit
 installed.
@@ -81,6 +81,7 @@ _DEFAULT_OSC_ACTION_MIN = np.asarray(
 _DEFAULT_OSC_ACTION_MAX = np.asarray(
     (0.05, 0.05, 0.05, 0.5, 0.5, 0.5), dtype=np.float32
 )
+_DEFAULT_EXECUTION_ACTION_INDEX = 1
 
 
 def _normalize_osc_delta(delta, action_min=None, action_max=None):
@@ -156,6 +157,12 @@ class FDPService:
             config["dp"]["backbone"] = str(Path(backbone).expanduser().resolve())
         self.config = config
         self.seed = int(seed)
+        runtime = config.get("runtime", {})
+        self.execution_action_index = int(
+            runtime.get("execution_action_index", _DEFAULT_EXECUTION_ACTION_INDEX)
+        )
+        if self.execution_action_index < 0:
+            raise ValueError("runtime.execution_action_index must be non-negative")
         self.engine = FDPInference.from_loaded_config(config)
         self.lock = threading.RLock()
         self.frame_index = 0
@@ -175,6 +182,9 @@ class FDPService:
             "max_cache_action": self.max_cache_action,
             "timestamp_step_sec": self.dt,
             "sample_rate_hz": 1.0 / self.dt,
+            "execution_action_index": getattr(
+                self, "execution_action_index", _DEFAULT_EXECUTION_ACTION_INDEX
+            ),
         }
 
     def reset(self):
@@ -221,9 +231,30 @@ class FDPService:
                 q=q, dq=dq, tau=tau, wrench=wrench_value,
             )
             result = self.engine.predict(observation)
+            predicted_delta_pos = None
             if result.ready:
+                if result.actions is None or result.actions.ndim != 2 or result.actions.shape[0] < 1:
+                    raise RuntimeError("FDP returned an empty action chunk")
+                # The checkpoint's action_start_index points at the current
+                # observation anchor.  Executing that row makes the OSC
+                # target equal to the current pose, so the arm settles at the
+                # first predicted waypoint and never advances.  Use the next
+                # native-rate target by default; short legacy chunks fall
+                # back to their only available action.
+                action_index = min(
+                    self.execution_action_index, int(result.actions.shape[0]) - 1
+                )
+                predicted_delta_pos = (
+                    np.asarray(result.actions[action_index][:3], dtype=np.float32) - eef_pos
+                )
+                print(
+                    f"[FDP action] frame={self.frame_index} action_index={action_index} "
+                    f"predicted_delta_pos [m]="
+                    f"{np.array2string(predicted_delta_pos, precision=5, separator=', ')}",
+                    flush=True,
+                )
                 action = absolute_pose_to_libero_action(
-                    result.actions[0], eef_pos, eef_quat,
+                    result.actions[action_index], eef_pos, eef_quat,
                     osc_action_min=state.get("osc_action_min"),
                     osc_action_max=state.get("osc_action_max"),
                 )
@@ -255,6 +286,12 @@ class FDPService:
                     "warmup_reason": result.info.get("warmup_reason"),
                     "future_wrench": future_wrench,
                     "future_wrench_offsets_s": future_offsets,
+                    "raw_future_has_contact": result.info.get("raw_future_has_contact"),
+                    "future_contact_gate": result.info.get("future_contact_gate"),
+                    "contact_wrench_held": result.info.get("contact_wrench_held"),
+                    "predicted_delta_pos": (
+                        None if predicted_delta_pos is None else predicted_delta_pos.tolist()
+                    ),
                     "future_contact_mode": result.info.get("future_contact_mode")}
 
 
@@ -322,7 +359,8 @@ def main(argv=None):
     server = ThreadingHTTPServer((args.host, args.port), _Handler)
     print(f"[fdp] serving on http://{args.host}:{args.port}; "
           f"dp_checkpoint={service.config['dp']['checkpoint']}; "
-          f"wm_checkpoint={service.config['cad_wm']['checkpoint']}", flush=True)
+          f"wm_checkpoint={service.config['cad_wm']['checkpoint']}; "
+          f"execution_action_index={service.execution_action_index}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

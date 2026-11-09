@@ -75,7 +75,7 @@ from robokit.connects.protocols import StepRequestFromPolicy, StepRequestFromEva
 from robokit.data_manager.utils_multiview import cat_multiview_video_with_another
 from robokit.debug_utils.images import concatenate_rgb_images, save_frames_as_video, plot_force_sensor_wrt_time
 from robokit.debug_utils.printer import print_batch
-from scripts.wrench_replay_plot import WrenchLivePlot
+from scripts.wrench_replay_plot import CameraLiveView, WrenchLivePlot
 
 
 class SingleForceEnv:
@@ -91,6 +91,8 @@ class SingleForceEnv:
             terminal_interactive: bool = False,
             show_wrench_plot: bool = False,
             wrench_plot_backend: str = "TkAgg",
+            show_camera_view: bool = False,
+            camera_view_backend: str = "TkAgg",
             wrench_plot_max_points: int = 400,
             # PhysicsHelper params
             phy_keywords: tuple = ("cabinet", "drawer", "door", "basket", "object", "tool"),
@@ -114,9 +116,14 @@ class SingleForceEnv:
         self.show_wrench_plot = bool(show_wrench_plot)
         self.wrench_plot_backend = wrench_plot_backend
         self.wrench_plot_max_points = wrench_plot_max_points
+        self.show_camera_view = bool(show_camera_view)
+        self.camera_view_backend = camera_view_backend
         self.wrench_plot = None
+        self.camera_view = None
         self._wrench_plot_disabled = False
         self._wrench_plot_error_reported = False
+        self._camera_view_disabled = False
+        self._camera_view_error_reported = False
         self.interactive = self.show_viewer or self.terminal_interactive
         # Viewer state is attached after the off-screen env is initialized.
         self.mujoco_viewer = None
@@ -220,6 +227,11 @@ class SingleForceEnv:
                 title=f"Live wrench | {self.task_name}",
                 max_points=self.wrench_plot_max_points,
                 backend=self.wrench_plot_backend,
+            )
+        if self.show_camera_view:
+            self.camera_view = CameraLiveView(
+                title=f"FDP cameras | {self.task_name}",
+                backend=self.camera_view_backend,
             )
 
         # 1) PhysicsHelper for dynamics randomization
@@ -342,6 +354,37 @@ class SingleForceEnv:
         except Exception as exc:
             self._disable_wrench_plot(exc)
 
+    def _disable_camera_view(self, error: Exception) -> None:
+        """Disable only camera plotting after a GUI error."""
+        if not self._camera_view_error_reported:
+            print(f"[camera-view] disabled after update error: {error}", flush=True)
+            self._camera_view_error_reported = True
+        self._camera_view_disabled = True
+        if self.camera_view is not None:
+            try:
+                self.camera_view.close()
+            except Exception:
+                pass
+
+    def _reset_camera_view(self) -> None:
+        if self.camera_view is None or self._camera_view_disabled:
+            return
+        try:
+            self.camera_view.reset()
+        except Exception as exc:
+            self._disable_camera_view(exc)
+
+    def record_camera_view(
+        self, timestamp_s: float, side_image: np.ndarray, wrist_image: np.ndarray
+    ) -> None:
+        """Display the exact unmodified frames sent to FDP."""
+        if self.camera_view is None or self._camera_view_disabled:
+            return
+        try:
+            self.camera_view.update(timestamp_s, side_image, wrist_image)
+        except Exception as exc:
+            self._disable_camera_view(exc)
+
     def record_wrench_prediction(
         self,
         anchor_timestamp_s: float,
@@ -367,6 +410,12 @@ class SingleForceEnv:
             except Exception:
                 pass
             self.wrench_plot = None
+        if self.camera_view is not None:
+            try:
+                self.camera_view.close()
+            except Exception:
+                pass
+            self.camera_view = None
         if self.mujoco_viewer is not None:
             self.mujoco_viewer.close()
             self.mujoco_viewer = None
@@ -555,6 +604,7 @@ class SingleForceEnv:
         self.step_cnt = 0
         self._fdp_previous_qvel = None
         self._reset_wrench_plot()
+        self._reset_camera_view()
         if hasattr(self, "visual_helper"):
             self.visual_helper.clear_dynamic_light_base()
             self.visual_helper.clear_camera_shift_base()
@@ -640,6 +690,7 @@ class SingleForceEnv:
                 f"expected {current_state.shape}, got {state.shape}"
             )
         self._reset_wrench_plot()
+        self._reset_camera_view()
         self.apply_dataset_model_file(model_file)
         self.env.set_flattened_state_and_forward(state)
         self.step_cnt = 0
@@ -653,6 +704,7 @@ class SingleForceEnv:
         self.step_cnt = 0
         self._fdp_previous_qvel = None
         self._reset_wrench_plot()
+        self._reset_camera_view()
         self.visual_helper.clear_dynamic_light_base()
         self.visual_helper.clear_camera_shift_base()
         init_states = self._load_benchmark_init_states()
@@ -908,6 +960,8 @@ class LiberoForceSocketEvaluator:
             terminal_interactive: bool = False,
             show_wrench_plot: bool = False,
             wrench_plot_backend: str = "TkAgg",
+            show_camera_view: bool = False,
+            camera_view_backend: str = "TkAgg",
     ):
         self.env = SingleForceEnv(
             hdf5_read_path=hdf5_read_path,
@@ -920,6 +974,8 @@ class LiberoForceSocketEvaluator:
             terminal_interactive=terminal_interactive,
             show_wrench_plot=show_wrench_plot,
             wrench_plot_backend=wrench_plot_backend,
+            show_camera_view=show_camera_view,
+            camera_view_backend=camera_view_backend,
             phy_keywords=phy_keywords,
         )
         self.language_goal = self.env.task_name.replace("_", " ")
@@ -1436,6 +1492,11 @@ class LiberoForceSocketEvaluator:
 
                 cur_primary_rgb = np_obs_dict["agentview_image"]  # (H,W,C) uint8
                 cur_gripper_rgb = np_obs_dict["robot0_eye_in_hand_image"]  # (H,W,C) uint8
+                env.record_camera_view(
+                    timestamp_s=float(env.step_cnt) * env.control_timestep,
+                    side_image=cur_primary_rgb,
+                    wrist_image=cur_gripper_rgb,
+                )
                 cur_joint_state = latest_robot_states_B_T_D[0, 0]  # (6+6) with force
                 fdp_state = None
                 if self.interface == "fdp":

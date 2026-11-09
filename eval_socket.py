@@ -161,6 +161,10 @@ LOAD_CAMERAS = [
               help="Open a live force/torque curve window during evaluation.")
 @click.option("--wrench-plot-backend", default="TkAgg", show_default=True,
               help="Matplotlib GUI backend used by --wrench-plot.")
+@click.option("--camera-view", is_flag=True, default=False,
+              help="Open a live window showing the exact FDP camera inputs.")
+@click.option("--camera-view-backend", default="TkAgg", show_default=True,
+              help="Matplotlib GUI backend used by --camera-view.")
 @click.option("--start-fdp-server", is_flag=True, default=False,
               help="Start the FDP/CAD-WM service automatically for this command.")
 @click.option("--fdp-config", default="configs/inference/fdp_cad_wm.yaml", show_default=True,
@@ -186,6 +190,7 @@ def main(checkpoint, output_dir, device, port,
          test_cnt: int = 50, test_start_seed: int = 130000,
          viewer: bool = False, interactive = None,
          wrench_plot: bool = False, wrench_plot_backend: str = "TkAgg",
+         camera_view: bool = False, camera_view_backend: str = "TkAgg",
          start_fdp_server: bool = False,
          fdp_config: str = "configs/inference/fdp_cad_wm.yaml",
          fdp_python: str = "conda run --no-capture-output -n fdp python",
@@ -372,6 +377,8 @@ def main(checkpoint, output_dir, device, port,
                 terminal_interactive=interactive,
                 show_wrench_plot=wrench_plot,
                 wrench_plot_backend=wrench_plot_backend,
+                show_camera_view=camera_view,
+                camera_view_backend=camera_view_backend,
                 phy_keywords=(
                     "cabinet", "drawer", "door", "basket", "object", "tool", "microwave",
                     # "robot",

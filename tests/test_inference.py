@@ -162,11 +162,141 @@ def test_optional_measured_phase_does_not_replace_cad_future():
     np.testing.assert_array_equal(obs["future_wrench"][0, 0, :, 0], np.arange(1, 9))
 
 
+@pytest.mark.parametrize("cutoff_hz", [2.0, 5.0])
+def test_lowpass_matches_step_response_and_forecasts_branch_from_observed_state(cutoff_hz):
+    target = np.arange(1, 7, dtype=np.float32) * 10
+
+    class ConstantWM(FakeWM):
+        def predict(self, history):
+            super().predict(history)
+            return np.broadcast_to(target, (8, 6)).copy()
+
+    model = FDPInference(
+        policy=FakePolicy(), dp_config=dp_config(), wrench_provider=ConstantWM(),
+        phase_wrench_source="measured", wrench_filter={"enabled": True, "cutoff_hz": cutoff_hz},
+    )
+    measured = np.arange(1, 7, dtype=np.float32) * 2
+    interval = 0.0505 # Within timing tolerance; use actual sensor intervals.
+
+    def run_episode():
+        for frame in range(9):
+            values = dict(observation(frame, wrench=np.zeros(6) if frame == 0 else measured).__dict__)
+            values["timestamp_s"] = frame * interval
+            result = model(InferenceObservation(**values))
+        return result
+
+    result = run_episode()
+    obs = model.policy.last_obs
+    for context, frame in enumerate((7, 8)):
+        indices = np.clip(np.arange(frame - 7, frame + 1), 0, None)
+        expected_history = (1 - np.exp(-2 * np.pi * cutoff_hz * indices[:, None] * interval)) * measured
+        np.testing.assert_allclose(obs["wrench"][0, context], expected_history, rtol=1e-6, atol=1e-6)
+        current = expected_history[-1]
+        expected_future = target + (current - target) * np.exp(
+            -2 * np.pi * cutoff_hz * model.future_offsets_s[:, None]
+        )
+        np.testing.assert_allclose(obs["future_wrench"][0, context], expected_future, rtol=1e-6, atol=1e-6)
+    np.testing.assert_array_equal(result.info["future_wrench"], np.broadcast_to(target, (8, 6)))
+    np.testing.assert_array_equal(result.info["policy_future_wrench"], obs["future_wrench"][0, -1])
+    # Predictions and q/dq/tau inputs cannot advance or alter observed filtering.
+    saved_state = model._filtered_phase.copy()
+    saved_obs = {key: value.clone() for key, value in obs.items()}
+    model.predict()
+    model.predict()
+    np.testing.assert_array_equal(model._filtered_phase, saved_state)
+    for key, value in saved_obs.items():
+        torch.testing.assert_close(model.policy.last_obs[key], value, rtol=0, atol=0)
+    assert model.wrench_provider.calls[-1]["q"][0, -1, 0] == 8
+    expected_actions = result.actions.copy()
+    model.reset()
+    assert model._filtered_phase is None
+    repeated = run_episode()
+    np.testing.assert_array_equal(repeated.actions, expected_actions)
+    np.testing.assert_array_equal(repeated.info["policy_future_wrench"], result.info["policy_future_wrench"])
+
+
+def test_lowpass_switch_and_cutoff_validation():
+    model = engine(phase_wrench_source="measured", wrench_filter={"enabled": False, "cutoff_hz": 2})
+    model.observe(observation(0, wrench=np.zeros(6)))
+    model(observation(1, wrench=np.ones(6) * 10))
+    np.testing.assert_array_equal(model.policy.last_obs["wrench"][0, -1, -1], np.ones(6) * 10)
+    np.testing.assert_array_equal(model.policy.last_obs["future_wrench"][0, -1, :, 0], np.arange(2, 10))
+    with pytest.raises(ValueError, match="wrench_filter.cutoff_hz"):
+        engine(wrench_filter={"enabled": True, "cutoff_hz": 0})
+
+
+def test_filtered_wm_targets_bypass_future_lowpass_while_measurements_are_filtered():
+    model = engine(
+        phase_wrench_source="measured",
+        wrench_filter={"enabled": True, "cutoff_hz": 2.0, "apply_to_future": False},
+    )
+    model.observe(observation(0, wrench=np.zeros(6)))
+    result = model(observation(1, wrench=np.full(6, 10)))
+    expected_measured = 10 * (1 - np.exp(-2 * np.pi * 2 * 0.05))
+    np.testing.assert_allclose(model.policy.last_obs["wrench"][0, -1, -1], expected_measured, rtol=1e-6)
+    # Each image keeps its original forecast, including the earlier context.
+    np.testing.assert_array_equal(model.policy.last_obs["future_wrench"][0, 0, :, 0], np.arange(1, 9))
+    np.testing.assert_array_equal(model.policy.last_obs["future_wrench"][0, 1, :, 0], np.arange(2, 10))
+    np.testing.assert_array_equal(result.info["policy_future_wrench"], result.info["future_wrench"])
+
+
 def test_runtime_future_contact_mode_override_is_validated_without_touching_sampling():
     model = engine(phase_wrench_source="measured", future_contact_mode="legacy_rollout")
     assert model.future_contact_mode == "legacy_rollout"
     with pytest.raises(ValueError, match="future_contact_mode"):
         engine(future_contact_mode="invalid")
+
+
+def test_stable_future_is_cached_once_per_observation_and_reset_per_episode():
+    class ContactDetector:
+        def token_contact(self, wrench):
+            return torch.linalg.vector_norm(wrench[..., :3], dim=-1) > 8.0
+
+    class GatedPolicy(FakePolicy):
+        future_contact_mode = "token_threshold"
+        contact_fusion_gate = True
+        contact_detector = ContactDetector()
+
+    class ScriptedWM(FakeWM):
+        def predict(self, history):
+            super().predict(history)
+            chunk = np.zeros((8, 6), dtype=np.float32)
+            chunk[:, 0] = 5
+            indices = {0: [7], 2: [7], 3: [6, 7]}.get(len(self.calls) - 1, [])
+            chunk[indices, 0] = 20
+            return chunk
+
+    model = FDPInference(
+        policy=GatedPolicy(), dp_config=dp_config(), wrench_provider=ScriptedWM(),
+        phase_wrench_source="measured",
+        future_contact_stabilization={"enabled": True, "enter_frames": 2, "exit_frames": 2},
+    )
+    for frame in range(4):
+        result = model(observation(frame, wrench=np.zeros(6)))
+    assert result.info["future_contact_gate"] == [False, True]
+    assert result.info["raw_future_has_contact"] == [True, True]
+    np.testing.assert_array_equal(model.policy.last_obs["future_wrench"][0, 0], np.zeros((8, 6)))
+    accepted = model.policy.last_obs["future_wrench"][0, 1].numpy().copy()
+    np.testing.assert_array_equal(accepted, result.info["future_wrench"])
+    held = model(observation(4, wrench=np.zeros(6)))
+    assert held.info["contact_wrench_held"] == [False, True]
+    assert held.info["future_contact_gate"] == [True, True]
+    np.testing.assert_array_equal(held.info["policy_future_wrench"], accepted)
+    assert float(held.info["future_wrench"][:, 0].max()) == 5.0
+    for _ in range(3):
+        assert model.predict().info["future_contact_gate"] == [True, True]
+    off = model(observation(5, wrench=np.zeros(6)))
+    assert off.info["future_contact_gate"] == [True, False]
+    np.testing.assert_array_equal(model.policy.last_obs["future_wrench"][0, 0], accepted)
+    np.testing.assert_array_equal(model.policy.last_obs["future_wrench"][0, 1], np.zeros((8, 6)))
+    model.reset()
+    model.observe(observation(0, wrench=np.zeros(6)))
+    np.testing.assert_array_equal(model._policy_observations()["future_wrench"], np.zeros((1, 1, 8, 6)))
+
+
+def test_contact_stabilization_requires_shared_token_threshold_fusion():
+    with pytest.raises(ValueError, match="requires token_threshold"):
+        engine(future_contact_stabilization={"enabled": True})
 
 
 def test_timestamp_gaps_duplicates_and_episode_reuse_are_rejected_without_consuming_state():
@@ -253,10 +383,28 @@ def test_replay_has_no_ground_truth_wrench_dependency_and_preserves_observe_rate
         np.testing.assert_array_equal(data["frame_index"], [2, 4, 6])
         assert data["actions"].shape == (3, 8, 7)
         assert data["future_wrench"].shape == (3, 8, 6)
+        np.testing.assert_array_equal(data["policy_future_wrench"], data["future_wrench"])
         assert data["action_format"].item() == "absolute_ee_pose_xyz_xyzw"
     assert json.loads(output.with_suffix(".json").read_text())["wrench_source"] == "cad_wm"
     with pytest.raises(FileExistsError):
         run_replay(model, replay_config)
+
+
+def test_replay_middle_start_warms_filter_from_episode_origin(replay_config):
+    with h5py.File(replay_config["replay"]["dataset"], "a") as file:
+        wrench = np.ones((8, 6), dtype=np.float32) * 10
+        wrench[0] = 0
+        file.create_dataset("data/demo_0/obs/wrenches", data=wrench)
+    replay_config["replay"].update(start_frame=3, max_frames=3, predict_every=1)
+    model = engine(phase_wrench_source="measured", wrench_filter={"enabled": True, "cutoff_hz": 2})
+    report = run_replay(model, replay_config)
+    assert report["warmup_sensor_frames"] == 3 and report["sensor_frames"] == 3
+    assert report["prediction_chunks"] == 3 and len(model.wrench_provider.calls) == 6
+    expected = 10 * (1 - np.exp(-2 * np.pi * 2 * 5 / 20))
+    np.testing.assert_allclose(model.policy.last_obs["wrench"][0, -1, -1], expected, rtol=1e-6)
+    with np.load(report["output"]) as data:
+        np.testing.assert_array_equal(data["frame_index"], [3, 4, 5])
+        assert not np.array_equal(data["policy_future_wrench"], data["future_wrench"])
 
 
 def test_config_paths_are_anchored_to_config_file_not_cwd(tmp_path, monkeypatch):
@@ -275,6 +423,8 @@ def test_config_check_can_compare_training_contracts_before_wm_training(tmp_path
     cfg = load_config()
     cfg["cad_wm"]["checkpoint"] = None
     teacher_cfg = dp_config()
+    teacher_cfg.task.dataset.wrench_filter = {"enabled": True, "cutoff_hz": 2.0}
+    cfg["runtime"]["wrench_filter"] = {"enabled": True, "cutoff_hz": 2.0}
     teacher_cfg.n_obs_steps = 2
     teacher_cfg.n_action_steps = 8
     teacher_cfg.logging = {"name": "${now:%Y.%m.%d-%H.%M.%S}_teacher"}
@@ -288,6 +438,9 @@ def test_config_check_can_compare_training_contracts_before_wm_training(tmp_path
     assert report["ready_to_load"] is False
     assert report["cad_wm_checkpoint"] is None
     assert report["sample_rate_hz"] == 20 and report["action_shape"] == [8, 7]
+    assert report["wrench_filter_matches_training"] is True
+    cfg["runtime"]["wrench_filter"]["cutoff_hz"] = 5.0
+    assert check_config(cfg)["wrench_filter_matches_training"] is False
     wm_config = yaml.safe_load(Path(cfg["cad_wm"]["train_config"]).read_text())
     wm_config["dataloader"]["high_fps"] = 50
     mismatched = tmp_path / "wm.yaml"
