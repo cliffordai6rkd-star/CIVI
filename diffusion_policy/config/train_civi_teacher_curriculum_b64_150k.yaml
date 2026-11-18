@@ -1,0 +1,9 @@
+# Compatibility name: unified CIVI with batch 64.
+defaults:
+  - train_civi_teacher
+  - _self_
+name: train_civi_teacher_curriculum_b64_150k
+dataloader:
+  batch_size: 64
+val_dataloader:
+  batch_size: 64

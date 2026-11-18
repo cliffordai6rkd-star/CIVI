@@ -1,4 +1,4 @@
-"""Distill a frozen image-query policy context into a wrench-conditioned renderer."""
+"""Distill a frozen image-query policy's behavior into a wrench-conditioned renderer."""
 
 import pathlib
 import logging
@@ -19,7 +19,7 @@ CONFIG_DIR = pathlib.Path(__file__).resolve().parent / "diffusion_policy" / "con
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 
-@hydra.main(version_base=None, config_path=str(CONFIG_DIR), config_name="train_distill_render_net")
+@hydra.main(version_base=None, config_path=str(CONFIG_DIR), config_name="train_distill_render_net_student")
 def main(cfg):
     OmegaConf.resolve(cfg)
     distributed = initialize_distributed(cfg.training)
@@ -34,7 +34,9 @@ def main(cfg):
                     if isinstance(handler, logging.FileHandler):
                         logging.getLogger().removeHandler(handler)
                         handler.close()
-        TrainDistillRenderNetWorkspace(
+        workspace_cls = hydra.utils.get_class(cfg.get(
+            "_target_", "diffusion_policy.workspace.train_distill_render_net_workspace.TrainDistillRenderNetWorkspace"))
+        workspace_cls(
             cfg, output_dir=shared_output_dir(distributed), distributed=distributed,
         ).run()
     finally:

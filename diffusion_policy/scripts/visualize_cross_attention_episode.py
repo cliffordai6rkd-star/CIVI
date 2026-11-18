@@ -49,6 +49,7 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf, open_dict
 
+from diffusion_policy.common.dataset_config import canonical_dataset_config
 from diffusion_policy.policy.force_aware_diffusion_transformer_policy import (
     ForceAwareDiffusionTransformerPolicy,
 )
@@ -197,6 +198,9 @@ def load_checkpoint_payload(checkpoint_path: pathlib.Path):
         cfg = OmegaConf.load(config_path)
     if not OmegaConf.is_config(cfg):
         cfg = OmegaConf.create(cfg)
+    dataset_config = OmegaConf.select(cfg, "task.dataset")
+    if dataset_config is not None:
+        canonical_dataset_config(dataset_config)
     return payload, cfg
 
 
@@ -243,7 +247,7 @@ def instantiate_episode_dataset(
     dataset_override: Optional[pathlib.Path],
     video_backend: str,
 ):
-    dataset_cfg = copy.deepcopy(cfg.task.dataset)
+    dataset_cfg = canonical_dataset_config(copy.deepcopy(cfg.task.dataset))
     with open_dict(dataset_cfg):
         # Include every episode so --episode is independent of the training
         # validation split.  Disable augmentation and whole-dataset preload;

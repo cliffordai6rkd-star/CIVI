@@ -3,7 +3,8 @@
 The returned attention maps keep the original softmax over wrench keys.  The
 update maps are channel-wise L2 norms of MultiheadAttention's projected output,
 before the encoder's optional query residual and feed-forward block.
-Both maps use the latest observation of a single episode sample.
+Both maps use the latest observation of a single episode sample. When the
+complete fusion gate is closed, both maps are zero: computed CA is discarded.
 """
 
 import inspect

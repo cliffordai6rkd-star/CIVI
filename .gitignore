@@ -1,62 +1,77 @@
-# Python caches and build metadata
 __pycache__/
-*.py[cod]
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-*.egg-info/
-/build/
-/dist/
+*.pyc
+*.pyo
+*.pyd
 
-# Local environments and credentials
 .venv/
 venv/
-.conda-env/
-.env
-.env.*
-!.env.example
-!.env.sample
+env/
+.python-version
 
-# Local datasets and converted recordings (keep source packages named dataset)
-/dataset/
-/data/cache/
-/data/outputs/
-*.h5
-*.hdf5
-*.parquet
-*.zarr/
+.agents/
+_bmad/
 
-# Training outputs, model weights, and experiment logs
+data/
+data_converter/dataset/
 outputs/
-checkpoints/
+model_output/
 wandb/
-runs/
-mlruns/
-*.ckpt
+logs/
+checkpoints/
+models/
+pretrain_models/
+
+# Local package/model caches and Docker wheel download artifacts.
+.cache/
+.hf/
+.huggingface/
+huggingface/
+hf_cache/
+torch_cache/
+wheelhouse/
+.wheelhouse/
+pip-wheel-metadata/
+!docker_for_train/wheelhouse/
+!docker_for_train/wheelhouse/torch/
+docker_for_train/wheelhouse/torch/*
+!docker_for_train/wheelhouse/torch/.gitkeep
+
+docker/*.tar
+docker/*.tar.gz
+docker/*.tgz
+docker_for_train/*.tar
+docker_for_train/*.tar.gz
+docker_for_train/*.tgz
+
+*.zip
+*.tar
+*.gz
+*.bz2
+*.xz
+*.7z
+
 *.pt
 *.pth
+*.ckpt
+*.npy
+*.npz
+*.zarr
+*.h5
+*.hdf5
+*.bin
 *.safetensors
 *.onnx
-*.npz
-*.npy
-*.log
-MUJOCO_LOG.TXT
-events.out.tfevents*
-.hydra/
+*.engine
+*.whl
+*.pkl
+*.pickle
+*.mp4
+*.avi
 
-# Generated training plots
-loss_epoch.png
-val_loss_epoch.png
-loss_steps.png
-loss_summary.png
-full_dataset_mse_steps.png
+build/
+dist/
+*.egg-info/
 
-# Editor, OS, and local agent state
-.DS_Store
-Thumbs.db
-.ipynb_checkpoints/
-.vscode/
 .idea/
-.codex/
-.agents/
-.serena/
+.vscode/
+.DS_Store

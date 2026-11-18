@@ -1,36 +1,93 @@
-# read the contents of your README file
-from os import path
+from pathlib import Path
 
-from setuptools import find_packages, setup
+from setuptools import find_namespace_packages, setup
 
-this_directory = path.abspath(path.dirname(__file__))
-with open(path.join(this_directory, "./README.md"), encoding="utf-8") as f:
-    lines = f.readlines()
 
-# remove images from README
-lines = [x for x in lines if ".png" not in x]
-long_description = "".join(lines)
+ROOT = Path(__file__).resolve().parent
+DESCRIPTION = "CIVI: contact-informed DiT teacher and causal RGB student distillation."
+README_PATH = ROOT / "README.md"
+LONG_DESCRIPTION = (
+    README_PATH.read_text(encoding="utf-8")
+    if README_PATH.is_file()
+    else DESCRIPTION
+)
+
+CORE_DEPENDENCIES = [
+    # Keep shared ABI-sensitive packages aligned with nero_ws.
+    "numpy>=2.2,<2.3",
+    "h5py>=3.11",
+    "scipy>=1.10,<1.16",
+    # 4.12 wheels require CXXABI_1.3.15, which is absent on common CUDA
+    # training images. Keep the pip fallback compatible with their system ABI;
+    # the Conda environment uses the conda-forge OpenCV package directly.
+    "opencv-python-headless>=4.9,<4.12",
+    "PyYAML>=6.0",
+    "matplotlib>=3.7",
+    "pin>=3,<4; platform_system == 'Linux'",
+    "cmeel-tinyxml2>=10,<11; platform_system == 'Linux'",
+    "cmeel-urdfdom>=4,<5; platform_system == 'Linux'",
+    "numba>=0.66,<0.67",
+    # Current LeRobot 0.4 / RTX 5090 training runtime.  The CUDA 12.8
+    # wheel index is selected by the pinned requirements and Docker files.
+    "torch>=2.7,<2.8",
+    "torchvision>=0.22,<0.23",
+    "hydra-core>=1.3,<1.4",
+    "omegaconf>=2.3,<2.4",
+    "einops>=0.8,<0.9",
+    "diffusers>=0.35,<0.36",
+    "transformers>=4.56,<5",
+    "huggingface-hub>=0.35,<1",
+    "zarr>=2.18,<3",
+    "numcodecs>=0.13,<0.14",
+    "pyarrow>=20,<21",
+    "tqdm>=4.67,<5",
+    "Pillow>=11,<13",
+    "filelock>=3.16,<4",
+    "pandas>=2.2,<3",
+]
+
+EXTRAS = {
+    "lerobot": [
+        "lerobot==0.4.0",
+        # LeRobot 0.4 requires TorchCodec >=0.2.1,<0.6.0.
+        "torchcodec==0.5",
+        # TorchCodec CUDA 0.5 needs the CUDA 12 NPP runtime on Linux.
+        "nvidia-npp-cu12>=12.4,<13; platform_system == 'Linux'",
+    ],
+    "training": [
+        "accelerate>=1.10,<2",
+        # LeRobot 0.4.0 requires wandb>=0.20,<0.22.
+        "wandb>=0.20,<0.22",
+        "tensorboard>=2.15,<3",
+        "dill>=0.3.8,<0.4",
+    ],
+    "test": [
+        "pytest>=7,<9",
+    ],
+}
+EXTRAS["all"] = sorted(
+    {dependency for dependencies in EXTRAS.values() for dependency in dependencies}
+)
+
 
 setup(
-    name="libero",
-    packages=[package for package in find_packages() if package.startswith("libero")],
-    install_requires=[],
-    eager_resources=["*"],
-    include_package_data=True,
-    python_requires=">=3",
-    description="LIBERO: Benchmarking Knowledge Transfer for Lifelong Robot Learning",
-    author="Bo Liu, Yifeng Zhu, Chongkai Gao, Yihao Feng, Qiang Liu, Yuke Zhu, Peter Stone",
-    # url="https://github.com/ARISE-Initiative/robosuite",
-    author_email="bliu@cs.utexas.edu, yifengz@cs.utexas.edu",
-    version="0.1.0",
-    long_description=long_description,
+    name="civi",
+    version="0.2.0",
+    description=DESCRIPTION,
+    long_description=LONG_DESCRIPTION,
     long_description_content_type="text/markdown",
-    entry_points={
-        "console_scripts": [
-            "lifelong.main=libero.lifelong.main:main",
-            "lifelong.eval=libero.lifelong.evaluate:main",
-            "libero.config_copy=scripts.config_copy:main",
-            "libero.create_template=scripts.create_template:main",
+    author="Diffusion Policy Team",
+    license="MIT",
+    python_requires=">=3.10,<3.11",
+    packages=find_namespace_packages(include=["diffusion_policy*"]),
+    include_package_data=True,
+    package_data={
+        "diffusion_policy": [
+            "config/**/*.yaml",
+            "config/**/*.yml",
         ]
     },
+    install_requires=CORE_DEPENDENCIES,
+    extras_require=EXTRAS,
+    zip_safe=False,
 )

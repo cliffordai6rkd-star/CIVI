@@ -3,8 +3,92 @@ import pathlib
 from typing import Iterable, Optional, Sequence, Tuple
 
 
+def load_config_reference(config_ref: str, overrides=(), *, include_hydra=False):
+    """Compose a YAML file with the same defaults/interpolations as the CLI."""
+    from hydra import compose, initialize_config_dir
+    from hydra.core.global_hydra import GlobalHydra
+    from omegaconf import OmegaConf
+
+    path = pathlib.Path(config_ref).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Config does not exist: {path}")
+    OmegaConf.register_new_resolver("eval", eval, replace=True)
+    # Student training is already inside a Hydra application. Restore its
+    # composition context after independently loading the teacher's defaults.
+    global_hydra = GlobalHydra.instance()
+    previous = global_hydra.hydra
+    global_hydra.clear()
+    try:
+        with initialize_config_dir(version_base=None, config_dir=str(path.parent)):
+            return compose(
+                config_name=path.stem,
+                overrides=list(overrides),
+                return_hydra_config=include_hydra,
+            )
+    finally:
+        GlobalHydra.instance().hydra = previous
+
+
+def configured_output_dir(cfg) -> pathlib.Path:
+    """Resolve the run directory once, before starting either training stage."""
+    from omegaconf import OmegaConf
+
+    output = cfg.get("output_dir") or OmegaConf.select(cfg, "hydra.run.dir")
+    if not output:
+        raise ValueError("Config must specify output_dir or hydra.run.dir")
+    return pathlib.Path(str(output)).expanduser().resolve()
+
+
 _CONFIG_REF_OPTIONS = ("-c", "--config")
 _LEGACY_CONFIG_OPTIONS = ("--config-name", "-cn", "--config-dir", "-cd")
+
+
+def parse_overwrite_argv(argv: Sequence[str]) -> tuple[list[str], bool]:
+    """Consume the one-shot reset flag before Hydra parses its arguments."""
+    overwrite = "--overwrite" in argv[1:]
+    if not overwrite:
+        return list(argv), False
+
+    args = [argv[0]] + [arg for arg in argv[1:] if arg != "--overwrite"]
+    if len(args) == 1:
+        raise SystemExit(
+            "--overwrite requires a training config, for example: "
+            "python train.py --config-name=train_civi_teacher --overwrite"
+        )
+    # Override resume regardless of argument order, before Hydra saves its
+    # config snapshot. Never persist a destructive 'overwrite=true' setting:
+    # loading that snapshot later for resume must not erase the run again.
+    fresh_settings = {
+        "training.resume": "false",
+        "training.resume_from": "null",
+        "logging.resume": "false",
+    }
+    args = [args[0]] + [
+        arg for arg in args[1:]
+        if arg.split("=", 1)[0].lstrip("+~") not in fresh_settings
+    ]
+    # Keep positional overrides together: argparse otherwise rejects new
+    # overrides appended after '--cfg job' when overrides preceded that flag.
+    insert_at = len(args)
+    value_options = {
+        "-c", "--config", "--config-dir", "-cd", "--config-name", "-cn",
+        "--config-path", "-cp", "--cfg", "--package", "-p", "--info",
+        "--experimental-rerun", "--shell-completion", "-sc",
+    }
+    skip_value = False
+    for index, arg in enumerate(args[1:], start=1):
+        if skip_value:
+            skip_value = False
+            continue
+        if arg in value_options:
+            skip_value = True
+        elif not arg.startswith("-") and ("=" in arg or arg.startswith(("+", "~"))):
+            insert_at = index
+            break
+    args[insert_at:insert_at] = [
+        f"++{key}={value}" for key, value in fresh_settings.items()
+    ]
+    return args, True
 
 
 def split_config_reference(

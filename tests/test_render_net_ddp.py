@@ -1,6 +1,7 @@
 """Exercise real DDP collectives without requiring multiple CUDA devices."""
 
 from datetime import timedelta
+from itertools import product
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +30,8 @@ class TinyEncoder(nn.Module):
         self.backbone = nn.Conv2d(3, 4, 1)
         self.image_keys = ("side",)
         self.patch_counts = {"side": 4}
+        self.wrench_history_steps = 1
+        self.max_obs_steps = 1
 
     def encode_image_context(self, images, *, input_grad=False):
         image = images["side"][:, 0]
@@ -61,6 +64,8 @@ class TinyPreprocessor(nn.Module):
 
 class TinyRenderer(nn.Module):
     backbone_name = "test"
+    image_encoder_name = "test"
+    wrench_encoder_name = "test"
 
     def __init__(self):
         super().__init__()
@@ -93,8 +98,10 @@ class TinyDataset:
 
 def _config(root):
     cfg = OmegaConf.load(Path(__file__).resolve().parents[1] /
-                         "diffusion_policy/config/train_distill_render_net.yaml")
+                         "diffusion_policy/config/train_distill_render_net_student.yaml")
     del cfg["hydra"]
+    cfg.distillation.objective = "token_mse" # This fixture exercises the legacy obs-only teacher.
+    cfg.distillation.use_teacher_ffn = False # TinyEncoder has no fusion FFN modules.
     cfg.teacher_checkpoint = str(root / "teacher.ckpt")
     cfg.teacher_cache.directory = str(root / "teacher_cache")
     cfg.teacher_cache.batch_size = 2
@@ -106,8 +113,11 @@ def _config(root):
     cfg.training.compile.enabled = False
     cfg.training.num_epochs = 1
     cfg.training.max_grad_norm = 1e6
-    cfg.render_net.architecture_version = 1
+    # This fixture replaces both networks; its teacher has no LSTM to copy.
+    cfg.render_net.initialize_wrench_from_teacher = False
     cfg.render_net.high_attention_render.enabled = False
+    cfg.render_net.phase_predictor.enabled = False
+    cfg.training.render_stages = {"enabled": False, "transition": "epoch"}
     cfg.logging.progress_bar = False
     cfg.logging.plot_every_steps = 0
     for loader in (cfg.dataloader, cfg.val_dataloader):
@@ -122,18 +132,20 @@ def _config(root):
 def _exercise_real_renderer(rank):
     # Exercise the actual LSTM, camera embedding, attention and mask parameters
     # through DDP, including compiled backbone calls and an external frozen net.
-    for compile_backbone in (False, True):
+    for rendering_mode, compile_backbone in product(("residual", "gaussian_glow"), (False, True)):
         torch.manual_seed(17)
         renderer = RenderNet(
             wrench_dim=6, base_channels=4, conditioning_dim=8,
             wrench_history_steps=3, max_obs_steps=2,
             image_keys=("side", "wrist"), conv_block="bottleneck",
-            transformer={"patch_size": 2, "embed_dim": 8, "depth": 1, "num_heads": 2},
-            high_attention_render={"enabled": compile_backbone},
+            rendering_mode=rendering_mode, glow={"num_blobs": 3},
+            patch_size=2, embed_dim=8, image_self_attn_layers=1, cross_attn_layers=1, num_heads=2,
+            decoder_layers=1,
+            high_attention_render={"enabled": compile_backbone or rendering_mode == "gaussian_glow"},
         )
         encoder = nn.Conv2d(3, 4, 1).eval().requires_grad_(False)
         if compile_backbone:
-            renderer.compile_backbone(backend="eager", fullgraph=True, dynamic=False)
+            renderer.compile_backbone(backend="aot_eager", fullgraph=True, dynamic=False)
         model = torch.nn.parallel.DistributedDataParallel(renderer, broadcast_buffers=False)
         optimizer = torch.optim.AdamW(renderer.parameters(), lr=0.001)
         torch.manual_seed(101 + rank)
@@ -171,9 +183,9 @@ def _worker(rank, root):
         distill.hydra.utils.instantiate = lambda cfg: TinyDataset(root / "data")
 
         class MainLogger(RenderNetTrainingLogger):
-            def __init__(self, *args):
+            def __init__(self, *args, **kwargs):
                 assert rank == 0, "Only rank 0 may open the shared log"
-                super().__init__(*args)
+                super().__init__(*args, **kwargs)
 
             def save_plot(self):
                 pass

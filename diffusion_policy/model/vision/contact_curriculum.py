@@ -231,14 +231,54 @@ class HysteresisContactDetector(nn.Module):
                 result[..., index] = state
             return result
 
-        # Each future observation has its own initial state, then scans its K
-        # future wrench samples in order.
+        # A future chunk is only K samples long (often fewer than
+        # ``enter_frames``).  Require the configured streak when it fits, but
+        # shorten it to the remaining suffix when contact starts late in the
+        # chunk.  This preserves debounce for early noise while preventing a
+        # late contact from being discarded merely because the horizon ends
+        # first; ``fill_future_wrench_prefix`` then fills the physical prefix
+        # from the first confirmed token.
         states = []
         for obs_index in range(magnitude.shape[1]):
-            states.append(self._scan_tokens(
-                magnitude[:, obs_index], initial_state=initial_state[:, obs_index]
-            ))
+            values = magnitude[:, obs_index]
+            state = initial_state[:, obs_index].to(device=values.device, dtype=torch.bool)
+            chunk = torch.zeros_like(values, dtype=torch.bool)
+            above_count = torch.zeros_like(state, dtype=torch.long)
+            required_count = torch.full_like(above_count, self.enter_frames)
+            below_count = torch.zeros_like(state, dtype=torch.long)
+            for index in range(values.shape[-1]):
+                above = values[:, index] > self.contact_threshold.to(values)
+                below = values[:, index] < self.free_threshold.to(values)
+                above_count = torch.where(above, above_count + 1, torch.zeros_like(above_count))
+                late_onset = values.shape[-1] - index < self.enter_frames
+                required_count = torch.where(
+                    above & (above_count == 1),
+                    torch.full_like(required_count, 1 if late_onset else self.enter_frames),
+                    required_count,
+                )
+                below_count = torch.where(below, below_count + 1, torch.zeros_like(below_count))
+                enter = (~state) & (above_count >= required_count)
+                leave = state & (below_count >= self.exit_frames)
+                state = torch.where(enter, torch.ones_like(state), state)
+                state = torch.where(leave, torch.zeros_like(state), state)
+                chunk[:, index] |= state
+                above_count = torch.where(enter, torch.zeros_like(above_count), above_count)
+                required_count = torch.where(
+                    enter, torch.full_like(required_count, self.enter_frames), required_count
+                )
+                below_count = torch.where(leave, torch.zeros_like(below_count), below_count)
+            states.append(chunk)
         return torch.stack(states, dim=1)
+
+    def token_contact(self, raw_wrench: torch.Tensor) -> torch.Tensor:
+        """Threshold each physical-unit token independently at the entry threshold.
+
+        This deliberately has no hysteresis, debounce or initial state. It does
+        not change the historical state detection in ``forward`` or the legacy
+        future state scan in ``rollout_future``.
+        """
+        magnitude = self._per_token_magnitude(raw_wrench)
+        return magnitude > self.contact_threshold.to(magnitude)
 
     def _per_token_magnitude(self, raw_wrench: torch.Tensor) -> torch.Tensor:
         if raw_wrench.ndim != 4:
@@ -312,6 +352,8 @@ class MaskProbabilityScheduler(nn.Module):
         piecewise_steps: Optional[Sequence[int]] = None,
         piecewise_probabilities: Optional[Sequence[float]] = None,
         piecewise_interpolation: str = "linear",
+        total_steps: Optional[int] = None,
+        piecewise_fractions: Optional[Sequence[float]] = None,
     ) -> None:
         super().__init__()
         supported = {"constant", "linear", "cosine", "exponential", "piecewise"}
@@ -336,26 +378,60 @@ class MaskProbabilityScheduler(nn.Module):
         self.end_probability = float(end_probability)
         self.exponential_rate = float(exponential_rate)
         self.piecewise_interpolation = piecewise_interpolation
+        self.piecewise_fractions = None
+        self.auto_total_steps = piecewise_fractions is not None and total_steps is None
+        self.total_steps = None
 
+        if piecewise_fractions is not None:
+            if piecewise_steps:
+                raise ValueError(
+                    "provide either piecewise_steps or piecewise_fractions, not both"
+                )
+            fractions = tuple(float(value) for value in piecewise_fractions)
+            if (
+                len(fractions) < 1
+                or any(not math.isfinite(value) or not 0.0 <= value <= 1.0 for value in fractions)
+                or tuple(sorted(set(fractions))) != fractions
+            ):
+                raise ValueError(
+                    "piecewise_fractions must be sorted finite values in [0, 1]"
+                )
+            self.piecewise_fractions = fractions
         self.piecewise_steps = tuple(int(step) for step in (piecewise_steps or ()))
+        if self.piecewise_fractions is not None and total_steps is not None:
+            self.set_total_steps(total_steps)
         self.piecewise_probabilities = tuple(
             float(value) for value in (piecewise_probabilities or ())
         )
         if self.schedule_type == "piecewise":
-            if len(self.piecewise_steps) < 1:
+            boundaries = self.piecewise_fractions or self.piecewise_steps
+            if len(boundaries) < 1:
                 raise ValueError("piecewise schedule requires at least one step")
-            if len(self.piecewise_steps) != len(self.piecewise_probabilities):
+            if len(boundaries) != len(self.piecewise_probabilities):
                 raise ValueError("piecewise steps and probabilities must have equal length")
             if tuple(sorted(self.piecewise_steps)) != self.piecewise_steps:
                 raise ValueError("piecewise steps must be sorted")
             if any(not 0.0 <= value <= 1.0 for value in self.piecewise_probabilities):
                 raise ValueError("piecewise probabilities must be in [0, 1]")
 
+    def set_total_steps(self, total_steps: int) -> None:
+        total_steps = int(total_steps)
+        if total_steps < 1:
+            raise ValueError("piecewise_fractions requires a positive total_steps")
+        if self.piecewise_fractions is not None:
+            steps = tuple(int(round(value * total_steps)) for value in self.piecewise_fractions)
+            if tuple(sorted(set(steps))) != steps:
+                raise ValueError("piecewise_fractions must map to distinct optimizer steps")
+            self.piecewise_steps = steps
+        self.total_steps = total_steps
+
     def probability(self, optimizer_step: int) -> float:
         step = int(optimizer_step)
         if self.schedule_type == "constant":
             return self.start_probability
         if self.schedule_type == "piecewise":
+            if self.piecewise_fractions is not None and self.total_steps is None:
+                raise RuntimeError("Set the optimizer-step budget before using the mask curriculum")
             return self._piecewise_probability(step)
         if step <= self.start_step:
             return self.start_probability
@@ -396,65 +472,6 @@ class MaskProbabilityScheduler(nn.Module):
     def forward(self, optimizer_step: int) -> float:
         return self.probability(optimizer_step)
 
-
-class BlurSigmaScheduler(MaskProbabilityScheduler):
-    """Schedule Gaussian standard deviation in input-image pixels."""
-
-    def __init__(
-        self,
-        start_sigma: float = 5.0,
-        end_sigma: float = 0.0,
-        piecewise_sigmas: Optional[Sequence[float]] = None,
-        **kwargs,
-    ) -> None:
-        sigmas = [float(start_sigma), float(end_sigma)]
-        points = [float(value) for value in (piecewise_sigmas or ())]
-        if any(not math.isfinite(value) or value < 0 for value in (*sigmas, *points)):
-            raise ValueError("blur sigmas must be finite and non-negative")
-        self.sigma_scale = max(*sigmas, *points, 1.0)
-        super().__init__(
-            start_probability=sigmas[0] / self.sigma_scale,
-            end_probability=sigmas[1] / self.sigma_scale,
-            piecewise_probabilities=[value / self.sigma_scale for value in points],
-            **kwargs,
-        )
-
-    def sigma(self, optimizer_step: int) -> float:
-        return self.probability(optimizer_step) * self.sigma_scale
-
-    def forward(self, optimizer_step: int) -> float:
-        return self.sigma(optimizer_step)
-
-
-def gaussian_blur_images(images: torch.Tensor, sigma: float) -> torch.Tensor:
-    """Separable Gaussian blur on [..., C, H, W], with an exact identity at zero.
-
-    Kernels span three standard deviations, limited by reflect-padding bounds.
-    Filtering runs in float32 even inside the policy's AMP context.
-    """
-    if not math.isfinite(sigma) or sigma < 0:
-        raise ValueError("blur sigma must be finite and non-negative")
-    if sigma == 0:
-        return images
-    channels, height, width = images.shape[-3:]
-    with torch.autocast(device_type=images.device.type, enabled=False):
-        result = images.reshape(-1, channels, height, width).float()
-        for axis, size in ((-1, width), (-2, height)):
-            radius = min(math.ceil(3 * sigma), size - 1)
-            if radius == 0:
-                continue
-            positions = torch.arange(-radius, radius + 1, device=images.device, dtype=torch.float32)
-            kernel = torch.exp(-0.5 * (positions / sigma).square())
-            kernel = kernel / kernel.sum()
-            if axis == -1:
-                padding, shape = (radius, radius, 0, 0), (1, 1, 1, -1)
-            else:
-                padding, shape = (0, 0, radius, radius), (1, 1, -1, 1)
-            weight = kernel.reshape(shape).expand(channels, -1, -1, -1)
-            result = F.conv2d(F.pad(result, padding, mode="reflect"), weight, groups=channels)
-    return result.reshape_as(images).to(images.dtype)
-
-
 class ContactAwareImageMasker(nn.Module):
     """Sample whole-image token masks for selected contact-target windows.
 
@@ -465,10 +482,10 @@ class ContactAwareImageMasker(nn.Module):
 
     def __init__(self, scope: str = "full_context") -> None:
         super().__init__()
-        if scope not in {"current_observation", "full_context"}:
+        if scope not in {"current_observation", "full_context", "precontact_contact"}:
             raise ValueError(
                 f"Unsupported mask scope={scope!r}; "
-                "expected 'current_observation' or 'full_context'."
+                "expected 'current_observation', 'full_context', or 'precontact_contact'."
             )
         self.scope = scope
 
@@ -488,6 +505,12 @@ class ContactAwareImageMasker(nn.Module):
         if not enabled or probability <= 0.0:
             return result
 
+        if self.scope == "precontact_contact":
+            if probability >= 1.0:
+                return contact_mask.clone()
+            return contact_mask & (torch.rand(contact_mask.shape, device=contact_mask.device,
+                                              generator=generator) < probability)
+
         latest_contact = contact_mask[:, -1]
         if probability >= 1.0:
             selected = latest_contact
@@ -503,3 +526,131 @@ class ContactAwareImageMasker(nn.Module):
             return selected[:, None].expand_as(contact_mask).clone()
         result[:, -1] = selected
         return result
+
+
+class FactrBlurScheduler(nn.Module):
+    """Hold Gaussian blur, then linearly open vision between two step fractions.
+
+    Fractions are relative to the planned optimizer-update budget. A null
+    budget is supplied by the training workspace after building dataloaders;
+    explicit budgets and phase boundaries retain historical run behavior.
+    """
+
+    def __init__(
+        self,
+        total_steps: Optional[int] = None,
+        schedule_type: str = "linear",
+        start_sigma: float = 5.0,
+        end_sigma: float = 0.0,
+        start_fraction: float = 0.25,
+        end_fraction: float = 0.75,
+    ) -> None:
+        super().__init__()
+        if schedule_type != "linear":
+            raise ValueError("FACTR blur schedule_type must be 'linear'")
+        start_sigma = float(start_sigma)
+        end_sigma = float(end_sigma)
+        if not math.isfinite(start_sigma) or not math.isfinite(end_sigma):
+            raise ValueError("blur sigmas must be finite")
+        if start_sigma < 0 or end_sigma < 0 or start_sigma < end_sigma:
+            raise ValueError("blur sigmas must be non-negative with start_sigma >= end_sigma")
+        start_fraction = float(start_fraction)
+        end_fraction = float(end_fraction)
+        if (
+            not math.isfinite(start_fraction)
+            or not math.isfinite(end_fraction)
+            or not 0.0 <= start_fraction < end_fraction <= 1.0
+        ):
+            raise ValueError("blur phase fractions must satisfy 0 <= start < end <= 1")
+        self.auto_total_steps = total_steps is None
+        self.total_steps = None
+        if total_steps is not None:
+            self.set_total_steps(total_steps)
+        self.schedule_type = schedule_type
+        self.start_sigma = start_sigma
+        self.end_sigma = end_sigma
+        self.start_fraction = start_fraction
+        self.end_fraction = end_fraction
+
+    def set_total_steps(self, total_steps: int) -> None:
+        total_steps = int(total_steps)
+        if total_steps <= 0:
+            raise ValueError("total_steps must be positive")
+        self.total_steps = total_steps
+
+    def sigma(self, optimizer_step: int) -> float:
+        if self.total_steps is None:
+            raise RuntimeError("Set the optimizer-step budget before using the blur curriculum")
+        progress = min(max(int(optimizer_step), 0), self.total_steps) / self.total_steps
+        if progress <= self.start_fraction:
+            return self.start_sigma
+        if progress >= self.end_fraction:
+            return self.end_sigma
+        middle_progress = (progress - self.start_fraction) / (
+            self.end_fraction - self.start_fraction
+        )
+        return self.start_sigma + middle_progress * (self.end_sigma - self.start_sigma)
+
+    def forward(self, optimizer_step: int) -> float:
+        return self.sigma(optimizer_step)
+
+
+# Copied from FACTR's factr/utils.py (Apache-2.0):
+# https://github.com/RaindragonD/FACTR/blob/5a20d69342d9d234fd588c10b7c3e62ea559c9b0/factr/utils.py
+def gaussian_2d_kernel(
+    kernel_size: int, sigma: float, device=None, dtype=None
+) -> torch.Tensor:
+    """Build FACTR's normalized square Gaussian kernel."""
+    if int(kernel_size) < 1:
+        raise ValueError("kernel_size must be positive")
+    if not math.isfinite(float(sigma)) or float(sigma) <= 0:
+        raise ValueError("sigma must be finite and positive")
+    coords = torch.arange(kernel_size, device=device, dtype=dtype)
+    coords = coords - (kernel_size - 1) / 2.0
+    x, y = torch.meshgrid(coords, coords, indexing="xy")
+    kernel = torch.exp(-0.5 * (x.square() + y.square()) / sigma**2)
+    return kernel / kernel.sum()
+
+
+def gaussian_2d_smoothing(img: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    """Apply FACTR's depthwise 2-D Gaussian smoothing to ``[..., C, H, W]``."""
+    scale = float(scale)
+    if not math.isfinite(scale) or scale < 0:
+        raise ValueError("blur scale must be finite and non-negative")
+    if scale == 0:
+        return img
+    if img.ndim < 3:
+        raise ValueError("img must have shape [..., C, H, W]")
+    channels, height, width = (int(value) for value in img.shape[-3:])
+    kernel_size = max(3, 2 * math.ceil(3 * scale) + 1)
+    # Float16 convolution is not available on every supported CPU.  FACTR
+    # performs the same operation in the input dtype; use float32 only for
+    # those low-precision inputs and cast the result back afterward.
+    work_dtype = torch.float32 if img.dtype in {torch.float16, torch.bfloat16} else img.dtype
+    input_image = img.to(work_dtype)
+    kernel = gaussian_2d_kernel(
+        kernel_size, scale, device=img.device, dtype=work_dtype
+    ).view(1, 1, kernel_size, kernel_size)
+    kernel = kernel.repeat(channels, 1, 1, 1)
+    original_shape = tuple(img.shape)
+    flat = input_image.reshape(-1, channels, height, width)
+    blurred = F.conv2d(flat, kernel, groups=channels, padding=kernel_size // 2)
+    return blurred.reshape(original_shape).to(img.dtype)
+
+
+def select_contact_blur_mask(
+    contact_mask: torch.Tensor, scope: str = "full_context"
+) -> torch.Tensor:
+    """Select contact-target observations for deterministic pixel blurring."""
+    if contact_mask.ndim != 2 or contact_mask.dtype != torch.bool:
+        raise ValueError("contact_mask must be a bool tensor with shape [B, To]")
+    if scope not in {"current_observation", "full_context"}:
+        raise ValueError(
+            f"Unsupported blur scope={scope!r}; expected 'current_observation' or 'full_context'."
+        )
+    selected = contact_mask[:, -1]
+    if scope == "full_context":
+        return selected[:, None].expand_as(contact_mask)
+    result = torch.zeros_like(contact_mask)
+    result[:, -1] = selected
+    return result

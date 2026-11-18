@@ -1,7 +1,8 @@
-"""Train only RenderNet to match a frozen teacher's observation context."""
+"""Train only RenderNet using a frozen teacher's context or denoising outputs."""
 
 import contextlib
 import copy
+import dill
 import fcntl
 import hashlib
 import itertools
@@ -11,33 +12,43 @@ import math
 import pathlib
 import random
 import shutil
+import sys
 import time
 
 import hydra
 import numpy as np
 import torch
 import torch.distributed as dist
-from omegaconf import OmegaConf, open_dict
+from omegaconf import ListConfig, OmegaConf, open_dict
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 from diffusion_policy.common.render_net_training_logger import RenderNetTrainingLogger
+from diffusion_policy.common.checkpoint_action_mse import resolve_student_teacher
+from diffusion_policy.common.dataset_config import canonical_dataset_config
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.common.teacher_cache_lifecycle import TeacherCacheLifecycle
 from diffusion_policy.dataset.render_net_teacher_cache import (
     CACHE_VERSION, CachedTeacherDataset, TeacherTargetCache, cache_key, dataset_source_signature,
 )
 from diffusion_policy.dataset.image_result_cache import use_shared_ram_result_cache
+from diffusion_policy.model.diffusion.ema_model import EMAModel
 from diffusion_policy.model.vision.render_net import RenderNet, build_render_net
+from diffusion_policy.model.vision.response_distillation import response_weighted_token_mse
 from diffusion_policy.model.vision.render_net_attention import (
-    attention_regions, teacher_attention_targets, validate_percentiles,
+    attention_regions, context_effect_patch_weights, context_effect_regions,
+    percentile_region, teacher_attention_targets, teacher_context_effect_targets,
+    validate_percentiles, teacher_zero_context_target,
 )
-from diffusion_policy.model.vision.wrench_preprocessing import WrenchPreprocessor
+from diffusion_policy.model.vision.wrench_preprocessing import (
+    WRENCH_PREPROCESSING_VERSION, WrenchPreprocessor, fusion_gate_from_phase,
+)
 from diffusion_policy.scripts.visualize_cross_attention_episode import (
-    instantiate_policy, load_checkpoint_payload,
+    instantiate_policy, load_checkpoint_payload, patch_grid,
 )
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 from diffusion_policy.workspace.train_force_aware_diffusion_workspace import (
@@ -48,6 +59,27 @@ from diffusion_policy.workspace.train_force_aware_diffusion_workspace import (
 log = logging.getLogger(__name__)
 
 
+REGION_SOURCE_ALIASES = {
+    # Canonical names exposed in the config.
+    "noise_attention": "noise_attention",
+    "context": "context",
+    # Names used by earlier runs; keep them loadable for old checkpoints.
+    "attention": "noise_attention",
+    "context_effect": "context",
+}
+
+
+def normalize_region_source(source):
+    source = str(source).strip().lower()
+    try:
+        return REGION_SOURCE_ALIASES[source]
+    except KeyError as exc:
+        choices = ", ".join(("noise_attention", "context"))
+        raise ValueError(
+            f"high_attention_render.source must be one of: {choices}"
+        ) from exc
+
+
 class _NullTrainingLogger:
     def log(self, data):
         pass
@@ -56,21 +88,84 @@ class _NullTrainingLogger:
         pass
 
 
-def student_context_tokens(teacher, render_net, obs, *, return_aux=False, image_context_encoder=None):
-    """Only RGB and normalized wrench enter RenderNet; no teacher force/fusion path."""
-    images, wrench, _, _ = teacher.prepare_context_inputs(obs)
-    rendered, masks = render_net(images, wrench, return_aux=True)
+def student_context_tokens(teacher, render_net, obs, *, return_aux=False,
+                           return_contact=False, image_context_encoder=None,
+                           use_teacher_ffn=False, return_condition=False):
+    """Render RGB, encode it, and retain any student-owned visual calibration."""
+    prepare_with_future = getattr(teacher, "prepare_context_inputs_with_future_contact", None)
+    if prepare_with_future is not None:
+        images, wrench, contact, future_contact = prepare_with_future(obs)
+    else:
+        # Lightweight teacher adapters used by existing render-only callers
+        # expose the original four-value preprocessing interface.
+        images, wrench, contact, future_contact = teacher.prepare_context_inputs(obs)
+        if future_contact is None:
+            future_contact = contact
+    # The Dataset alpha is shared with the teacher; the complete future mask
+    # also lets render-only callers compute the same continuous blend weight.
+    renderer_impl = getattr(render_net, "module", render_net)
+    phase_binary = getattr(teacher, "fusion_gate_mode", "attention_alpha") == "phase_binary"
+    predict_phase = bool(getattr(renderer_impl, "phase_prediction_enabled", False))
+    if phase_binary and not predict_phase:
+        # Binary support is shared with the teacher, including the first
+        # precontact frame whose continuous alpha label is still zero.
+        future_contact = fusion_gate_from_phase(obs, teacher.n_obs_steps).unsqueeze(-1)
+    condition = None
+    if isinstance(renderer_impl, RenderNet):
+        predict_condition = renderer_impl.condition_prediction_enabled or predict_phase
+        result = render_net(
+            images, wrench, future_contact=future_contact, return_aux=True,
+            contact_alpha=(future_contact.squeeze(-1).float() if phase_binary and not predict_phase else
+                           obs["contact_alpha"][:, :teacher.n_obs_steps]
+                           if not predict_condition and "contact_alpha" in obs else None),
+            **({"return_condition": True} if predict_condition else {}),
+            **({"phase_inputs": obs.get("phase_inputs")} if predict_phase else {}),
+        )
+        if predict_condition:
+            rendered, masks, condition = result
+            if predict_phase:
+                future_contact = condition["contact_alpha"].bool().unsqueeze(-1)
+        else:
+            rendered, masks = result
+    else:
+        # Lightweight test/render adapters from older checkpoints may expose
+        # only the original two-input signature.
+        rendered, masks = render_net(images, wrench, return_aux=True)
     encode = teacher.obs_encoder.encode_image_context if image_context_encoder is None else image_context_encoder
-    tokens = encode(rendered, input_grad=True)
-    return (tokens, masks) if return_aux else tokens
+    adapter = getattr(renderer_impl, "context_adapter", None)
+    if use_teacher_ffn:
+        if adapter is not None:
+            raise ValueError("Student adapter cannot be combined with teacher FFN replay")
+        tokens = encode(rendered, input_grad=True, apply_fusion_ffn=True)
+    elif adapter is not None:
+        tokens = encode(rendered, input_grad=True, context_adapter=adapter)
+    else:
+        tokens = encode(rendered, input_grad=True)
+    if return_condition:
+        return tokens, masks, future_contact, condition
+    if return_aux and return_contact:
+        return tokens, masks, future_contact
+    if return_aux:
+        return tokens, masks
+    if return_contact:
+        return tokens, future_contact
+    return tokens
 
 
 class TrainDistillRenderNetWorkspace(BaseWorkspace):
+    phase_total_keys = tuple(f"phase_{name}_{suffix}"
+                             for name in ("free_false_open", "precontact_recall", "contact_recall")
+                             for suffix in ("sum", "count"))
+    # Additive statistics, reduced across batches/ranks before normalization.
+    contact_total_keys = ("contact_samples", "contact_token_sum", "contact_denoiser_sum",
+                          "contact_response_numerator", "contact_response_weight_sum")
     exclude_keys = ("teacher_policy", "_training_model")
     include_keys = ("global_step", "epoch", "best_val_loss", "initial_train_mse",
                     "initial_val_mse", "shape_info", "teacher_state_key", "latest_val_loss",
                     "best_epoch", "best_step", "epochs_without_improvement",
-                    "early_stopping_best_loss", "stop_reason")
+                    "early_stopping_best_loss", "stop_reason", "training_stage", "stage_step",
+                    "stage_epoch", "stage_transition_reason", "render_stages_enabled",
+                    "intensity_epochs", "adapter_epochs", "resume_architecture_report")
 
     def __init__(self, cfg, output_dir=None, distributed=None):
         super().__init__(cfg, output_dir)
@@ -86,6 +181,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         np.random.seed(seed)
         torch.manual_seed(seed)
         self.device = torch.device(str(cfg.training.device))
+        self._validate_distillation_config()
         if self.device.type == "cuda":
             if not torch.cuda.is_available():
                 raise RuntimeError("CUDA requested but unavailable; use training.device=cpu")
@@ -95,55 +191,159 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         torch.backends.cuda.matmul.allow_tf32 = bool(cfg.training.amp.allow_tf32)
         torch.backends.cudnn.allow_tf32 = bool(cfg.training.amp.allow_tf32)
 
-        checkpoint = pathlib.Path(str(cfg.teacher_checkpoint)).expanduser().resolve()
+        checkpoint, self.teacher_source_cfg = resolve_student_teacher(cfg)
+        if cfg.get("teacher_selection"):
+            score = cfg.teacher_selection
+            log.info("Selected teacher %s: checkpoint action MSE=%.8f, episodes=%s",
+                     checkpoint, score["checkpoint_action_mse"], score["episode_ids"])
+        else:
+            log.info("Using specified teacher checkpoint: %s", checkpoint)
         payload, self.teacher_cfg = load_checkpoint_payload(checkpoint)
-        if cfg.get("dino_model_path"):
-            with open_dict(self.teacher_cfg):
-                self.teacher_cfg.policy.dino_model_name_or_path = str(cfg.dino_model_path)
         self.teacher_state_key = "ema_model" if "ema_model" in payload["state_dicts"] else "model"
         self.teacher_policy = instantiate_policy(payload, self.teacher_cfg, self.device,
                                                  capture_attention=False)
         del payload
         if self.teacher_policy.obs_encoder.cross_attn_query != "image":
             raise ValueError("RenderNet distillation requires teacher cross_attn_query: image")
+        if self.convergence_stages_enabled and (
+                self.teacher_policy.obs_encoder.wrench_history_steps != 50
+                or self.teacher_policy.wrench_key != "tau_ext"
+                or self.teacher_policy.future_phase_wrench_key is not None
+                or self.teacher_policy.fusion_gate_mode != "phase_binary"):
+            raise ValueError("Unified CIVI requires a teacher trained with causal 50-frame tau_ext "
+                             "and phase_binary fusion. Train the unified teacher first; older "
+                             "8-frame or future-torque checkpoints retain their original configuration.")
         self.teacher_policy.eval().requires_grad_(False)
+        log.info("Student token supervision: frozen image encoder%s; deployment retains visual adapter=%s",
+                 " + teacher fusion FFNs" if self.use_teacher_ffn else "",
+                 bool(cfg.render_net.get("context_adapter", {}).get("enabled", False)))
         self.normalizer = self.teacher_policy.normalizer
         self.wrench_preprocessor = WrenchPreprocessor.from_policy(self.teacher_policy).eval().requires_grad_(False)
         with open_dict(self.cfg):
             self.cfg.wrench_preprocessing = self.wrench_preprocessor.get_config()
         wrench_dim = int(self.teacher_policy.obs_encoder.wrench_projection.in_features)
         render_config = OmegaConf.to_container(cfg.render_net, resolve=True)
-        if int(render_config.get("architecture_version", 1)) == 2:
-            encoder = self.teacher_policy.obs_encoder
-            render_config.update(
-                image_keys=list(encoder.image_keys),
-                wrench_history_steps=int(encoder.wrench_history_steps),
-                max_obs_steps=int(encoder.max_obs_steps),
-            )
-            if render_config.get("initialize_wrench_from_teacher", True):
-                if not isinstance(encoder.force_encoder, torch.nn.LSTM):
-                    raise ValueError("RenderNet teacher wrench initialization requires an LSTM teacher")
+        backbone_config = dict(render_config.pop("backbone", {}))
+        encoder = self.teacher_policy.obs_encoder
+        render_config.update(
+            image_keys=list(encoder.image_keys),
+            wrench_history_steps=int(encoder.wrench_history_steps),
+            max_obs_steps=int(encoder.max_obs_steps),
+        )
+        if render_config.get("context_adapter", {}).get("enabled", False):
+            # The adapter operates in the teacher's projected visual dimension.
+            render_config["conditioning_dim"] = int(encoder.n_emb)
+        if render_config.get("initialize_wrench_from_teacher", True):
+            teacher_force_encoder = getattr(encoder, "force_encoder", None)
+            if teacher_force_encoder is None:
+                # Lightweight adapters used for cache-only/compatibility runs
+                # may expose image encoding without the teacher wrench path.
+                # The active force-aware teacher always has this module.
+                log.warning("Teacher has no force_encoder; disabling RenderNet wrench initialization")
+                render_config["initialize_wrench_from_teacher"] = False
+            elif not isinstance(teacher_force_encoder, torch.nn.LSTM):
+                raise ValueError("RenderNet teacher wrench initialization requires an LSTM teacher")
+            else:
                 render_config.update(
                     conditioning_dim=int(encoder.n_emb),
-                    wrench_layers=int(encoder.force_encoder.num_layers),
-                    wrench_dropout=float(encoder.force_encoder.dropout),
+                    wrench_layers=int(teacher_force_encoder.num_layers),
+                    wrench_dropout=float(teacher_force_encoder.dropout),
                 )
-            with open_dict(self.cfg):
-                self.cfg.render_net = OmegaConf.create(render_config)
+        render_config.update(backbone_config)
+        with open_dict(self.cfg):
+            self.cfg.render_net = OmegaConf.create(render_config)
         self.model = build_render_net(wrench_dim, render_config).to(self.device)
-        if isinstance(self.model, RenderNet) and self.model.initialize_wrench_from_teacher:
+        if (isinstance(self.model, RenderNet) and self.model.initialize_wrench_from_teacher
+                and hasattr(self.teacher_policy.obs_encoder, "force_encoder")):
             self.model.initialize_wrench_encoder(self.teacher_policy.obs_encoder)
+        self.ema_model = self.ema = None
+        if cfg.training.get("use_ema", False):
+            self.ema_model = copy.deepcopy(self.model)
+            self.ema_model.eval().requires_grad_(False)
+            self.ema = EMAModel(self.ema_model, **dict(cfg.get("ema", {})))
         self.attention_config = cfg.render_net.get("high_attention_render", {})
         self.attention_enabled = bool(self.attention_config.get("enabled", False))
-        self.mask_loss_weight = float(self.attention_config.get("mask_loss_weight", 1.0))
+        self.intensity_loss_weight = float(
+            self.attention_config.get("intensity_loss_weight", 1.0)
+        )
+        self.context_patch_loss_weight = float(
+            self.attention_config.get("context_patch_loss_weight", 1.0)
+        )
+        self.smoothness_loss_weight = float(
+            self.attention_config.get("smoothness_loss_weight", 0.02)
+        )
+        self.region_source = normalize_region_source(
+            self.attention_config.get("source", "noise_attention")
+        )
         if self.attention_enabled:
-            validate_percentiles(self.attention_config["percentiles"])
-            if not math.isfinite(self.mask_loss_weight) or self.mask_loss_weight <= 0:
-                raise ValueError("high_attention_render.mask_loss_weight must be positive and finite")
+            selection = self.attention_config.get("selection", "soft")
+            if self.region_source == "context":
+                if self.attention_config.get("baseline", "raw_zero") != "raw_zero":
+                    raise ValueError("context supervision requires baseline=raw_zero")
+                if selection == "soft":
+                    normalization = self.attention_config.get("normalization")
+                    if normalization not in (None, "image_minmax"):
+                        raise ValueError(f"Unknown context normalization: {normalization!r}")
+                    if normalization is None:
+                        validate_percentiles(self.attention_config.get("percentiles", [80.0, 99.0]))
+                        strength_scale = self.attention_config.get("strength_scale")
+                        if strength_scale is not None and (
+                                not math.isfinite(float(strength_scale)) or float(strength_scale) <= 0):
+                            raise ValueError("context strength_scale must be positive and finite")
+                elif selection == "binary_top_percentile":
+                    percentile = float(self.attention_config.get("percentile", 90.0))
+                    if not 0 <= percentile < 100:
+                        raise ValueError("context binary selection requires 0 <= percentile < 100")
+                else:
+                    raise ValueError(
+                        "high_attention_render.selection must be soft or binary_top_percentile"
+                    )
+            elif self.region_source == "noise_attention":
+                validate_percentiles(self.attention_config["percentiles"])
+            for name, value in (("intensity_loss_weight", self.intensity_loss_weight),
+                                ("context_patch_loss_weight", self.context_patch_loss_weight),
+                                ("smoothness_loss_weight", self.smoothness_loss_weight)):
+                if not math.isfinite(value) or value < 0:
+                    raise ValueError(f"high_attention_render.{name} must be finite and nonnegative")
         self.loss_metrics = {}
         self._student_image_encoder = None
         self._training_model = None
+        stage_config = cfg.training.get("render_stages", {})
+        # A staged run needs a supervised gate.  If high-attention rendering
+        # is disabled, there is no intensity objective to warm up, so retain a
+        # single joint RGB training stage.
+        self.render_stages_enabled = (
+            bool(stage_config.get("enabled", True)) and self.attention_enabled
+            and hasattr(self.model, "set_training_stage")
+        )
+        self.intensity_epochs = int(stage_config.get(
+            "intensity_epochs", cfg.training.get("intensity_warmup_epochs", 2),
+        ))
+        if self.intensity_epochs < 0:
+            raise ValueError("training.render_stages.intensity_epochs must be nonnegative")
+        self.adapter_epochs = int(stage_config.get("adapter_epochs", 20))
+        if self.context_adapter_enabled and self.adapter_epochs < 1:
+            raise ValueError("training.render_stages.adapter_epochs must be positive")
+        self.training_stage = (
+            "phase" if self.convergence_stages_enabled else
+            "adapter" if self.context_adapter_enabled else
+            "intensity" if self.render_stages_enabled and self.intensity_epochs > 0
+            else ("rgb" if self.render_stages_enabled else "joint")
+        )
+        self.stage_step = 0
+        self.stage_epoch = 0
+        self.stage_transition_reason = "initial_config"
+        self.resume_architecture_report = None
         self.optimizer = torch.optim.AdamW(self.model.parameters(), **OmegaConf.to_container(cfg.optimizer))
+        self.lr_scheduler = None
+        scheduler_config = cfg.training.get("lr_scheduler", {})
+        if scheduler_config.get("enabled", False):
+            self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer, mode="min", factor=float(scheduler_config.get("factor", 0.5)),
+                patience=int(scheduler_config.get("patience", 2)),
+                threshold=float(scheduler_config.get("threshold", 1e-4)), threshold_mode="abs",
+                min_lr=float(scheduler_config.get("min_lr", 1e-5)),
+            )
         self.grad_scaler = torch.amp.GradScaler(
             "cuda", enabled=self.amp_enabled and self.amp_dtype == torch.float16,
         )
@@ -163,49 +363,366 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         self.started_at = time.monotonic()
         self.resume_from = None
         resume_path = cfg.training.get("resume_from")
+        warm_start_path = cfg.training.get("warm_start_from")
+        if resume_path and warm_start_path:
+            raise ValueError("Set only one of training.resume_from and training.warm_start_from")
         if resume_path:
             resume_path = pathlib.Path(str(resume_path)).expanduser().resolve()
             if not resume_path.is_file():
                 raise FileNotFoundError(f"RenderNet resume checkpoint does not exist: {resume_path}")
             # Restore optimizer/model and the loop counters, while keeping the
             # current Hydra output directory so a resumed run can append logs.
-            self.load_checkpoint(path=resume_path, include_keys=self.include_keys)
+            excluded = []
+            if self.lr_scheduler is None:
+                excluded.append("lr_scheduler")
+            if self.ema is None:
+                excluded.extend(("ema", "ema_model"))
+            try:
+                restored = torch.load(resume_path.open("rb"), pickle_module=dill,
+                                      map_location="cpu")
+                saved_cfg = restored.get("cfg", {})
+                saved_render = saved_cfg.get("render_net", {})
+                saved_backbone = saved_render.get("backbone", {})
+                saved_base = saved_backbone.get("base_channels", saved_render.get("base_channels"))
+                current_base = cfg.render_net.get("backbone", {}).get(
+                    "base_channels", cfg.render_net.get("base_channels")
+                )
+                mismatches = []
+                saved_state = restored.get("state_dicts", {}).get("model", {})
+                current_state = self.model.state_dict()
+                for key, value in saved_state.items():
+                    target = current_state.get(key)
+                    if target is None:
+                        mismatches.append(f"{key}: checkpoint-only")
+                    elif tuple(value.shape) != tuple(target.shape):
+                        mismatches.append(
+                            f"{key}: checkpoint{tuple(value.shape)} != current{tuple(target.shape)}"
+                        )
+                for key in current_state:
+                    if key not in saved_state:
+                        mismatches.append(f"{key}: current-only")
+                self.resume_architecture_report = {
+                    "status": "compatible" if not mismatches else "incompatible",
+                    "saved_base_channels": saved_base,
+                    "current_base_channels": current_base,
+                    "mismatched_keys": mismatches[:32],
+                    "mismatch_count": len(mismatches),
+                }
+                if mismatches:
+                    raise RuntimeError(
+                        "RenderNet checkpoint architecture mismatch; refusing to silently skip "
+                        f"{len(mismatches)} parameters (base_channels checkpoint={saved_base}, "
+                        f"current={current_base}). Examples: " + "; ".join(mismatches[:8])
+                    )
+                self.load_payload(restored, include_keys=self.include_keys, exclude_keys=excluded)
+                # Loading the fitted normalizer rebuilds its ParameterDict on
+                # CPU; the teacher and inference preprocessor share this object.
+                self.normalizer.to(self.device)
+            except (RuntimeError, KeyError, ValueError) as exc:
+                raise RuntimeError(
+                    "RenderNet checkpoint could not be resumed with the current architecture. "
+                    "Shape-mismatched or missing parameters are rejected explicitly; "
+                    f"Original error: {exc}"
+                ) from exc
+            saved_objective = restored["cfg"].get("distillation", {}).get("objective", "token_mse")
+            if saved_objective != self.objective:
+                raise ValueError("Cannot resume with a different distillation objective: "
+                                 f"checkpoint={saved_objective}, configured={self.objective}. "
+                                 "Start a new run so checkpoint selection metrics remain comparable.")
+            saved_phases = restored["cfg"].get("training", {}).get("sample_phases")
+            saved_phases = None if saved_phases is None else tuple(sorted(set(saved_phases)))
+            if saved_phases != self.sample_phases:
+                raise ValueError("Cannot resume with different training.sample_phases; use "
+                                 "training.warm_start_from in a new run to reset validation selection.")
+            if self.ema_model is not None and "ema_model" not in restored["state_dicts"]:
+                self.ema_model.load_state_dict(self.model.state_dict())
+                log.info("Checkpoint has no student EMA: initialize from restored RenderNet; "
+                         "EMA warmup starts at zero")
+            if self.lr_scheduler is not None and "lr_scheduler" not in restored["state_dicts"]:
+                if math.isfinite(self.best_val_loss):
+                    self.lr_scheduler.step(self.best_val_loss)
+                log.info("Checkpoint has no LR scheduler: retain optimizer LR, use saved best "
+                         "validation as baseline, and start plateau counting at zero")
+            if "training_stage" not in restored.get("pickles", {}):
+                self.training_stage = (
+                    "intensity" if self.render_stages_enabled and self.epoch < self.intensity_epochs
+                    else "rgb"
+                )
+                self.stage_transition_reason = "legacy_checkpoint_epoch_inference"
+            if hasattr(self.model, "set_training_stage"):
+                self.model.set_training_stage(self.training_stage)
+            if getattr(self, "ema", None) is not None:
+                # A resumed checkpoint may have been written before the stage
+                # transition fix.  Make the frozen gate snapshot identical in
+                # online and EMA models before validation or another update.
+                self.ema.sync_frozen_parameters(self.model)
             self.resume_from = str(resume_path)
             # A checkpoint may have been saved immediately before an orderly
             # stop; an explicit resume should always re-enter the epoch loop.
             self.stop_reason = None
             log.info("Resuming RenderNet from %s: epoch=%d step=%d best_val_mse=%.8f",
                      resume_path, self.epoch, self.global_step, self.best_val_loss)
+        elif warm_start_path:
+            # A new objective must start fresh optimization/selection counters,
+            # while retaining the already trained renderer and frozen conditions.
+            warm_start_path = pathlib.Path(str(warm_start_path)).expanduser().resolve()
+            restored = torch.load(warm_start_path, pickle_module=dill, map_location="cpu")
+            state_key = "ema_model" if "ema_model" in restored["state_dicts"] else "model"
+            self.model.load_state_dict(restored["state_dicts"][state_key], strict=True)
+            self.training_stage = "rgb"
+            self.stage_transition_reason = "warm_start:pretrained_student_to_rgb"
+            if self.ema_model is not None:
+                self.ema_model.load_state_dict(self.model.state_dict(), strict=True)
+            log.info("Warm-start RGB weights from %s (%s); new optimizer, EMA schedule and metrics",
+                     warm_start_path, state_key)
         self.num_epochs = int(cfg.training.num_epochs)
+        self.intensity_warmup_epochs = int(cfg.training.get("intensity_warmup_epochs", 2))
         self.max_steps = cfg.training.max_steps
         self.max_val_batches = cfg.training.max_val_batches
         self.early_stopping_enabled = bool(cfg.training.early_stopping.enabled)
         self.patience = int(cfg.training.early_stopping.patience)
         self.min_delta = float(cfg.training.early_stopping.min_delta)
-        if self.num_epochs < 1 or any(value is not None and int(value) < 1
-                                      for value in (self.max_steps, self.max_val_batches)):
-            raise ValueError("num_epochs must be positive; max_steps/max_val_batches must be positive or null")
+        if self.convergence_stages_enabled:
+            if not self.render_stages_enabled or not self.phase_prediction_enabled or not self.early_stopping_enabled:
+                raise ValueError("Validation-plateau stages require phase prediction, spatial supervision and early stopping")
+            if int(self.model.phase_predictor.num_classes) != 3:
+                raise ValueError("Validation-plateau stages require free/precontact/contact three-class prediction")
+            if self.context_adapter_enabled or self.condition_prediction_enabled:
+                raise ValueError("Three-stage CIVI uses the separate phase and spatial intensity heads")
+            stage_patience = int(stage_config.get("patience", self.patience))
+            stage_delta = float(stage_config.get("min_delta", self.min_delta))
+            if stage_patience < 1 or not math.isfinite(stage_delta) or stage_delta < 0:
+                raise ValueError("Stage patience must be positive and min_delta finite and nonnegative")
+        if self.num_epochs < 1 or self.intensity_warmup_epochs < 0 or any(
+                value is not None and int(value) < 1
+                for value in (self.max_steps, self.max_val_batches)):
+            raise ValueError("num_epochs must be positive; intensity_warmup_epochs nonnegative; "
+                             "max_steps/max_val_batches must be positive or null")
+        if (not self.convergence_stages_enabled and self.render_stages_enabled
+                and self.intensity_epochs > self.num_epochs):
+            raise ValueError("training.render_stages.intensity_epochs cannot exceed training.num_epochs")
+        if not resume_path:
+            if hasattr(self.model, "set_training_stage"):
+                self.model.set_training_stage(self.training_stage)
+        if getattr(self, "ema", None) is not None:
+            self.ema.sync_frozen_parameters(self.model)
         if self.patience < 1 or not math.isfinite(self.min_delta) or self.min_delta < 0:
             raise ValueError("early_stopping.patience must be positive; min_delta must be finite and nonnegative")
         log.info(f"Teacher: {checkpoint} ({self.teacher_state_key}), cross_attn_query=image")
         log.info(f"Trainable parameters: teacher=0, RenderNet={sum(p.numel() for p in self.model.parameters()):,}")
-        log.info(f"Backbone={self.model.backbone_name}; high-attention rendering={self.attention_enabled}")
+        log.info("Student validation/inference weights=%s; EMA updates=%d",
+                 self.evaluation_state_key, self.ema.optimization_step if self.ema is not None else 0)
+        if self.lr_scheduler is not None:
+            log.info("LR scheduler=ReduceLROnPlateau: monitor validation %s, factor=%g, "
+                     "reduce after %d non-improving epochs, threshold=%g, min_lr=%g",
+                     self.metric_name, self.lr_scheduler.factor, self.lr_scheduler.patience + 1,
+                     self.lr_scheduler.threshold, self.lr_scheduler.min_lrs[0])
+        log.info(f"Image encoder={self.model.image_encoder_name}; wrench encoder={self.model.wrench_encoder_name}; "
+                 f"high-attention rendering={self.attention_enabled}")
         if isinstance(self.model, RenderNet):
-            log.info("RenderNet v2: full LSTM sequence [B*To,%d,%d], image-query cross-attention, "
-                     "conv_block=%s, skip decoder, cameras=%s; teacher wrench initialization=%s",
+            log.info("RenderNet: full LSTM sequence [B*To,%d,%d], image self-attn=%d, cross-attn=%d, "
+                     "decoder=%d, conv_block=%s, rendering_mode=%s, cameras=%s; "
+                     "teacher wrench initialization=%s",
                      self.model.wrench_history_steps, self.model.wrench_encoder.hidden_size,
-                     self.model.conv_block, self.model.image_keys, self.model.initialize_wrench_from_teacher)
+                     len(self.model.backbone.image_self_attention),
+                     len(self.model.backbone.cross_attention),
+                     self.model.backbone.decoder_layers,
+                     self.model.conv_block, getattr(self.model, "rendering_mode", "residual"),
+                     self.model.image_keys, self.model.initialize_wrench_from_teacher)
         if self.attention_enabled:
-            log.info("Teacher attention: executed-action DiT→fusion→DINO patches, all denoising calls; "
-                  f"percentiles={list(self.attention_config['percentiles'])}; "
-                  "batched rollout on model device; student predicts region at inference; "
-                  "validation metric=token MSE")
+            if self.region_source == "context":
+                if self.attention_config.get("selection", "soft") == "soft":
+                    scale = self.attention_config.get("strength_scale")
+                    if self.attention_config.get("normalization") == "image_minmax":
+                        mapping = "per-image strength=(d-min)/(max-min); constant maps are zero"
+                    else:
+                        mapping = (f"strength=d/(d+{float(scale):g})" if scale is not None else
+                                   f"legacy percentiles={list(self.attention_config.get('percentiles', [80., 99.]))}")
+                    log.info("Teacher context: FP32 L2(Z(W)-Z(raw_zero)); %s; zero effect stays zero; "
+                             "student predicts the field during training and inference", mapping)
+                else:
+                    log.info("Teacher region: FP32 L2(Z(W)-Z(raw_zero)), binary top percentile=%g; "
+                             "student hard patch gate at inference, prediction threshold=%g; no teacher at inference",
+                             self.attention_config["percentile"],
+                             self.attention_config.get("prediction_threshold", 0.5))
+            else:
+                log.info("Teacher attention: executed-action DiT→fusion→DINO patches, all denoising calls; "
+                         f"percentiles={list(self.attention_config['percentiles'])}; "
+                         "batched rollout on model device; student predicts region at inference; "
+                         f"validation metric={self.metric_name}")
+        log.info("Distillation objective=%s; token auxiliary weight=%g; demo weight=%g; "
+                 "DINO and DiT stay frozen, student input gradients remain enabled",
+                 self.objective, self.distillation_config.get("token_loss_weight", 0.0),
+                 self.distillation_config.get("demo_loss_weight", 0.0))
+        if self.condition_prediction_enabled:
+            condition = self.model.condition_network
+            log.info("Shared region/alpha network: parameters=%d, embed=%d, self-attn=%d, cross-attn=%d; "
+                     "pretrain without RGB/DINO, freeze best snapshot before RGB distillation",
+                     sum(p.numel() for p in condition.parameters()), condition.backbone.embed_dim,
+                     len(condition.backbone.image_self_attention), len(condition.backbone.cross_attention))
+        if self.response_loss_weight > 0:
+            log.info("Student loss = global token MSE + %g * teacher-response-weighted token MSE; "
+                     "raw response noise floor=%g; normalize by effective weight sum",
+                     self.response_loss_weight, self.response_noise_floor)
         log.info(f"Device={self.device}; AMP={self.amp_enabled} {self.amp_dtype}; "
               f"GPU={torch.cuda.get_device_name(self.device) if self.device.type == 'cuda' else 'CPU'}")
         log.info(f"Max epochs={self.num_epochs}; max steps={self.max_steps}; "
+                 f"render stages={self.render_stages_enabled} "
+                 f"(intensity={self.intensity_epochs}, current={self.training_stage}); "
               f"validation={'all batches' if self.max_val_batches is None else self.max_val_batches}; "
               f"early stopping={self.early_stopping_enabled}, patience={self.patience} epochs, "
               f"min_delta={self.min_delta}")
+
+    @property
+    def distillation_config(self):
+        return getattr(self, "cfg", {}).get("distillation", {})
+
+    @property
+    def objective(self):
+        # Saved configurations predating behavior distillation retain their loss.
+        return str(self.distillation_config.get("objective", "token_mse"))
+
+    @property
+    def use_teacher_ffn(self):
+        # Historical student checkpoints retain their original visual loss path.
+        return bool(self.distillation_config.get("use_teacher_ffn", False))
+
+    @property
+    def metric_name(self):
+        if getattr(self, "training_stage", "joint") == "phase":
+            name = "phase cross entropy"
+        elif self.convergence_stages_enabled and self.training_stage == "intensity":
+            name = "context spatial intensity loss"
+        elif getattr(self, "training_stage", "joint") == "adapter":
+            name = "zero-wrench baseline token MSE"
+        elif self.condition_prediction_enabled and getattr(self, "training_stage", "joint") == "intensity":
+            name = "region/alpha loss"
+        elif self.response_loss_weight > 0:
+            name = "global + response-weighted token MSE"
+        else:
+            name = "denoiser MSE" if self.objective == "denoiser_mse" else "context token MSE"
+        if self.sample_phases is not None:
+            name += f" on anchor phases {list(self.sample_phases)}"
+        return name
+
+    @property
+    def sample_phases(self):
+        phases = getattr(self, "cfg", {}).get("training", {}).get("sample_phases")
+        return None if phases is None else tuple(sorted(set(phases)))
+
+    @property
+    def metric_scope(self):
+        return ("all" if self.sample_phases is None else
+                "anchor_phases_" + "_".join(map(str, self.sample_phases)))
+
+    @property
+    def condition_prediction_enabled(self):
+        return bool(getattr(getattr(self, "model", None), "condition_prediction_enabled", False))
+
+    @property
+    def phase_prediction_enabled(self):
+        return bool(getattr(getattr(self, "model", None), "phase_prediction_enabled", False))
+
+    @property
+    def convergence_stages_enabled(self):
+        return (getattr(self, "cfg", {}).get("training", {}).get("render_stages", {}).get("transition")
+                == "validation_plateau")
+
+    def _stage_patience(self):
+        if self.convergence_stages_enabled and self.training_stage in {"phase", "intensity"}:
+            return int(self.cfg.training.render_stages.get("patience", self.patience))
+        return self.patience
+
+    def _stage_min_delta(self):
+        if self.convergence_stages_enabled and self.training_stage in {"phase", "intensity"}:
+            return float(self.cfg.training.render_stages.get("min_delta", self.min_delta))
+        return self.min_delta
+
+    @property
+    def context_adapter_enabled(self):
+        return getattr(getattr(self, "model", None), "context_adapter", None) is not None
+
+    @property
+    def response_loss_weight(self):
+        return float(self.distillation_config.get("response_loss_weight", 0.0))
+
+    @property
+    def response_noise_floor(self):
+        return float(self.distillation_config.get("response_noise_floor", 1e-6))
+
+    def _early_stopping_active(self):
+        if self.convergence_stages_enabled:
+            return True
+        start_at_rgb = self.cfg.training.early_stopping.get("start_at_rgb", False)
+        return not start_at_rgb or self.training_stage == "rgb"
+
+    @property
+    def logging_objective(self):
+        if getattr(self, "training_stage", "joint") == "phase":
+            return "phase_cross_entropy"
+        if self.convergence_stages_enabled and self.training_stage == "intensity":
+            return "spatial_intensity"
+        if getattr(self, "training_stage", "joint") == "adapter":
+            return "adapter_warmup"
+        if self.condition_prediction_enabled and getattr(self, "training_stage", "joint") == "intensity":
+            return "condition_warmup"
+        return self.objective
+
+    @property
+    def evaluation_state_key(self):
+        return "ema_model" if getattr(self, "ema_model", None) is not None else "model"
+
+    def _step_lr_scheduler(self, validation_mse):
+        if self.lr_scheduler is None:
+            return
+        previous_lr = self.optimizer.param_groups[0]["lr"]
+        self.lr_scheduler.step(validation_mse)
+        current_lr = self.optimizer.param_groups[0]["lr"]
+        if current_lr < previous_lr and self.is_main_process:
+            log.info("Learning rate reduced: %.6g -> %.6g at epoch %d; validation %s=%.8f",
+                     previous_lr, current_lr, self.epoch, self.metric_name, validation_mse)
+
+    def _validate_distillation_config(self):
+        phases = self.cfg.get("training", {}).get("sample_phases")
+        if phases is not None and (
+                not isinstance(phases, (list, tuple, ListConfig)) or not phases
+                or any(isinstance(p, bool) or not isinstance(p, int) or p not in (0, 1, 2)
+                       for p in phases)):
+            raise ValueError("training.sample_phases must be null or a nonempty list of "
+                             "0=free, 1=pre-contact, 2=contact")
+        if self.objective not in {"token_mse", "denoiser_mse"}:
+            raise ValueError("distillation.objective must be token_mse or denoiser_mse")
+        if (self.cfg.get("render_net", {}).get("context_adapter", {}).get("enabled", False)
+                and self.use_teacher_ffn):
+            raise ValueError("Student context adaptation requires distillation.use_teacher_ffn=false")
+        for name in ("token_loss_weight", "demo_loss_weight", "response_loss_weight",
+                     "response_noise_floor", "alpha_loss_weight"):
+            value = float(self.distillation_config.get(name, 0.0))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"distillation.{name} must be finite and nonnegative")
+        if self.response_loss_weight > 0:
+            attention = self.cfg.render_net.get("high_attention_render", {})
+            if (self.objective != "token_mse" or not attention.get("enabled", False)
+                    or normalize_region_source(attention.get("source", "noise_attention")) != "context"):
+                raise ValueError("Response-weighted token MSE requires objective=token_mse and context responses")
+
+    @contextlib.contextmanager
+    def _validation_probes(self):
+        if self.objective != "denoiser_mse":
+            yield
+            return
+        seed = int(self.distillation_config.get("validation_seed", 42)) + self.distributed_context.rank
+        previous = getattr(self, "_validation_generator", None)
+        self._validation_generator = torch.Generator(device=self.device).manual_seed(seed)
+        devices = [self.device.index if self.device.index is not None else torch.cuda.current_device()] \
+            if self.device.type == "cuda" else []
+        try:
+            # DataLoader iterator creation can consume the default CPU RNG even
+            # though noise/timestep probes use a dedicated device generator.
+            with torch.random.fork_rng(devices=devices):
+                yield
+        finally:
+            self._validation_generator = previous
 
     @property
     def distributed_context(self):
@@ -238,7 +755,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
     def _instantiate_dataset(self, config):
         def instantiate():
             dataset = hydra.utils.instantiate(config)
-            # The Hirol dataset converts RAM preload into a shared tmpfs cache
+            # The robot dataset converts RAM preload into a shared tmpfs cache
             # under torchrun. Do not silently turn this into an SSD image cache.
             wants_ram = config.get("preload_images", False) and (
                 config.get("load_result_add", "ram") in (None, "", "ram", "memory", "mem")
@@ -294,7 +811,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                    "fullgraph": True, "dynamic": False}
         if config.get("render_backbone", True):
             if not isinstance(self.model, RenderNet):
-                raise ValueError("Compiling the RenderNet backbone requires architecture_version=2")
+                raise ValueError("Compiling requires the active RenderNet backbone")
             self.model.compile_backbone(**options)
         if config.get("student_dino", True):
             self._student_image_encoder = torch.compile(
@@ -304,40 +821,413 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                  "mode=%s; first training batch includes compilation; validation uses eager execution",
                  config.get("render_backbone", True), config.get("student_dino", True), options["mode"])
 
+    def _progress_enabled(self):
+        config = getattr(self, "cfg", {}).get("logging", {})
+        return (self.is_main_process and bool(config.get("progress_bar", True))
+                and (config.get("progress_bar_non_tty", True) or sys.stderr.isatty()))
+
     def _progress(self, iterable, description, total=None, *, initial=0, unit="batch"):
         config = getattr(self, "cfg", {}).get("logging", {})
         return tqdm(iterable, desc=description, total=total, initial=initial, unit=unit, dynamic_ncols=True,
                     mininterval=float(config.get("tqdm_interval_sec", 1.0)),
-                    disable=not self.is_main_process or not config.get("progress_bar", True))
+                    leave=bool(config.get("tqdm_leave", False)),
+                    disable=not self._progress_enabled())
+
+    def _status_interval(self):
+        return max(1.0, float(getattr(self, "cfg", {}).get("logging", {}).get("status_interval_sec", 60.0)))
 
     def _attention_progress(self, completed, total, elapsed):
         if completed == 0:
             self.attention_progress_last_seconds = 0.0
             return
-        if elapsed - self.attention_progress_last_seconds >= 30:
-            log.info(f"Teacher attention: samples={completed}/{total}, elapsed={elapsed:.1f}s, "
-                     f"ETA={(total - completed) * elapsed / completed:.1f}s")
+        if elapsed - self.attention_progress_last_seconds >= self._status_interval():
+            if not self._progress_enabled() and self.is_main_process:
+                log.info(f"Teacher attention: samples={completed}/{total}, elapsed={elapsed:.1f}s, "
+                         f"ETA={(total - completed) * elapsed / completed:.1f}s")
             self.attention_progress_last_seconds = elapsed
 
-    def _loss(self, obs, cached_targets=None):
-        # Validation and initial evaluation measure only token MSE. The student
-        # still uses its learned region head, but needs no teacher spatial mask.
-        supervise_regions = self.attention_enabled and self.model.training and torch.is_grad_enabled()
+    def _region_masks(self, patches, obs):
+        source = getattr(
+            self, "region_source",
+            normalize_region_source(self.attention_config.get("source", "noise_attention")),
+        )
+        if source == "context":
+            return context_effect_regions(patches, obs, self.teacher_policy.obs_encoder.backbone,
+                                          percentile=self.attention_config.get("percentile", 90.0),
+                                          percentiles=self.attention_config.get(
+                                              "percentiles", [80.0, 99.0]),
+                                          selection=self.attention_config.get("selection", "soft"),
+                                          strength_scale=self.attention_config.get("strength_scale"),
+                                          normalization=self.attention_config.get("normalization"))
+        return attention_regions(patches, obs, self.teacher_policy.obs_encoder.backbone,
+                                 self.attention_config["percentiles"])
+
+    def _region_targets(self, obs, *, return_patch_attention=False):
+        source = getattr(
+            self, "region_source",
+            normalize_region_source(self.attention_config.get("source", "noise_attention")),
+        )
+        if source == "context":
+            tokens, patches = teacher_context_effect_targets(
+                self.teacher_policy, obs, baseline=self.attention_config.get("baseline", "raw_zero"))
+            return tokens, (patches if return_patch_attention else self._region_masks(patches, obs))
+        return teacher_attention_targets(
+            self.teacher_policy, obs, percentiles=self.attention_config["percentiles"],
+            seed=self.attention_config.get("teacher_seed", 42),
+            progress_callback=self._attention_progress, return_patch_attention=return_patch_attention,
+        )
+
+    def _region_patch_targets(self, patches):
+        source = getattr(
+            self, "region_source",
+            normalize_region_source(self.attention_config.get("source", "noise_attention")),
+        )
+        if source == "context":
+            return context_effect_patch_weights(
+                patches,
+                percentile=self.attention_config.get("percentile", 90.0),
+                percentiles=self.attention_config.get("percentiles", [80.0, 99.0]),
+                selection=self.attention_config.get("selection", "soft"),
+                strength_scale=self.attention_config.get("strength_scale"),
+                normalization=self.attention_config.get("normalization"),
+            )
+        return {
+            key: percentile_region(value, self.attention_config["percentiles"])
+            for key, value in patches.items()
+        }
+
+    def _patch_pool(self, masks):
+        pooled = {}
+        backbone = self.teacher_policy.obs_encoder.backbone
+        for key, mask in masks.items():
+            batch, steps, _, height, width = mask.shape
+            grid = patch_grid(
+                self.teacher_policy.obs_encoder.patch_counts[key], height, width, backbone,
+            )
+            pooled[key] = F.adaptive_avg_pool2d(
+                mask.reshape(batch * steps, 1, height, width), grid,
+            ).reshape(batch, steps, -1)
+        return pooled
+
+    @staticmethod
+    def _intensity_smoothness(masks):
+        values = []
+        for mask in masks.values():
+            values.append(mask[..., 1:, :].sub(mask[..., :-1, :]).abs().mean())
+            values.append(mask[..., :, 1:].sub(mask[..., :, :-1]).abs().mean())
+        return torch.stack(values).mean() if values else torch.zeros(())
+
+    def _joint_training_active(self):
+        return (not self.model.training) or getattr(self, "training_stage", "joint") in {"rgb", "joint"}
+
+    @staticmethod
+    def _contact_token_metrics(student_tokens, teacher_tokens, contact_mask):
+        """Return contact ratio and token MSE split without changing gradients."""
+        if contact_mask is None:
+            contact_mask = torch.ones(
+                student_tokens.shape[0], 1, device=student_tokens.device, dtype=torch.bool,
+            )
+        if contact_mask.ndim == 3:
+            contact_mask = contact_mask.any(dim=-1)
+        if contact_mask.ndim != 2:
+            raise ValueError("contact mask must have shape [B, To] or [B, To, K]")
+        if student_tokens.shape[0] != contact_mask.shape[0]:
+            raise ValueError("contact mask batch size does not match context tokens")
+        steps = contact_mask.shape[1]
+        if steps < 1 or student_tokens.shape[1] % steps:
+            raise ValueError("context token layout is not divisible by observation steps")
+        tokens_per_step = student_tokens.shape[1] // steps
+        token_open = contact_mask.to(torch.bool).unsqueeze(-1).expand(
+            -1, -1, tokens_per_step,
+        ).reshape(student_tokens.shape[0], -1)
+        per_token = (student_tokens.float() - teacher_tokens.float()).square().mean(dim=-1)
+        open_values = per_token[token_open]
+        closed_values = per_token[~token_open]
+        zero = per_token.new_zeros(())
+        open_mse = open_values.mean() if open_values.numel() else zero
+        closed_mse = closed_values.mean() if closed_values.numel() else zero
+        return {
+            "contact_open_ratio": contact_mask.float().mean(),
+            "open_token_mse": open_mse,
+            "closed_token_mse": closed_mse,
+            "open_token_count": float(open_values.numel()),
+            "closed_token_count": float(closed_values.numel()),
+        }
+
+    def _maybe_transition_stage(self, completed_epochs=None):
+        """Apply the configured boundary before the next optimizer epoch."""
+        if self.convergence_stages_enabled:
+            desired = self.training_stage
+            if (self.training_stage in {"phase", "intensity"}
+                    and self.epochs_without_improvement >= self._stage_patience()):
+                desired = "intensity" if self.training_stage == "phase" else "rgb"
+        elif self.training_stage == "adapter":
+            desired = self.training_stage
+            if self.stage_epoch >= self.adapter_epochs:
+                desired = ("intensity" if self.render_stages_enabled and self.intensity_epochs > 0
+                           else "rgb" if self.render_stages_enabled else "joint")
+        elif not getattr(self, "render_stages_enabled", False):
+            desired = "joint"
+        else:
+            completed = self.epoch if completed_epochs is None else int(completed_epochs)
+            if self.context_adapter_enabled:
+                completed = self.stage_epoch
+            # A saved RGB stage is authoritative on resume.  An intensity
+            # checkpoint saved exactly at the boundary transitions before the
+            # next optimizer epoch.
+            desired = (
+                "rgb" if self.training_stage == "intensity"
+                and completed >= getattr(self, "intensity_epochs", 0)
+                else self.training_stage
+            )
+        if desired == self.training_stage:
+            if hasattr(self.model, "set_training_stage"):
+                self.model.set_training_stage(self.training_stage)
+            if getattr(self, "ema", None) is not None:
+                self.ema.sync_frozen_parameters(self.model)
+            return False
+        previous = self.training_stage
+        if self.convergence_stages_enabled or previous == "adapter" or (
+                self.condition_prediction_enabled and previous == "intensity" and desired == "rgb"):
+            if self.distributed_context.enabled:
+                dist.barrier()
+            tag = (f"best_{previous}" if self.convergence_stages_enabled else
+                   "best_adapter" if previous == "adapter" else "best_condition")
+            checkpoint = self.get_checkpoint_path(tag)
+            if self.convergence_stages_enabled and not checkpoint.is_file():
+                raise RuntimeError(f"Cannot freeze {previous}: best validation checkpoint is missing: {checkpoint}")
+            if checkpoint.is_file():
+                payload = torch.load(checkpoint, map_location="cpu", pickle_module=dill,
+                                     weights_only=False)
+                state_key = "ema_model" if self.ema_model is not None else "model"
+                self.model.load_state_dict(payload["state_dicts"][state_key], strict=True)
+                log.info("Freeze best %s snapshot: %s (%s)", previous, checkpoint, state_key)
+            # Each stage optimizes a different objective and disjoint parameters.
+            self.best_val_loss = self.early_stopping_best_loss = float("inf")
+            self.latest_val_loss = None
+            self.best_epoch = self.best_step = self.epochs_without_improvement = 0
+            self.optimizer.state.clear()
+            for group in self.optimizer.param_groups:
+                group["lr"] = float(self.cfg.optimizer.lr)
+            scheduler = self.cfg.training.get("lr_scheduler", {})
+            if self.lr_scheduler is not None:
+                self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    self.optimizer, mode="min", factor=float(scheduler.get("factor", .5)),
+                    patience=int(scheduler.get("patience", 2)),
+                    threshold=float(scheduler.get("threshold", 1e-4)), threshold_mode="abs",
+                    min_lr=float(scheduler.get("min_lr", 1e-5)),
+                )
+            if self.ema is not None:
+                self.ema.sync_parameters(self.model)
+                self.ema.optimization_step = 0
+                self.ema.decay = 0.0
+        self.training_stage = desired
+        self.stage_step = 0
+        self.stage_epoch = 0
+        self.stage_transition_reason = (
+            f"validation_plateau:{previous}->{desired}" if self.convergence_stages_enabled
+            else f"epoch_boundary:{previous}->{desired}")
+        if desired == "rgb" and self.cfg.training.early_stopping.get("start_at_rgb", False):
+            self.early_stopping_best_loss = float("inf")
+            self.epochs_without_improvement = 0
+        reset_rgb = False
+        if (not self.condition_prediction_enabled and previous == "intensity" and desired == "rgb"
+                and hasattr(self.model, "initialize_rgb_from_gate")):
+            # Transfer the completed gate representation once.  The gate
+            # branch remains independent and frozen after this snapshot;
+            # RGB then owns and updates its full encoder/decoder path.
+            self.model.initialize_rgb_from_gate()
+            reset_rgb = True
+        if hasattr(self.model, "set_training_stage"):
+            self.model.set_training_stage(desired)
+            gate_count = sum(p.numel() for p in self.model.gate_parameters())
+            rgb_count = sum(p.numel() for p in self.model.rgb_parameters())
+        else:
+            gate_count = rgb_count = 0
+        if getattr(self, "ema", None) is not None:
+            # The newly frozen gate must use one exact snapshot in both
+            # online and EMA models.  If RGB was copied from the gate, also
+            # reset its EMA branch to that same boundary state.
+            if reset_rgb:
+                self.ema.sync_parameters(self.model)
+            else:
+                self.ema.sync_frozen_parameters(self.model)
+        if self.distributed_context.enabled:
+            # DDP registers only parameters trainable at construction. Rebuild
+            # when stage ownership changes, including adapter -> condition/RGB.
+            self._training_model = None
+            self._setup_distributed_model()
+        log.info("RenderNet training stage transition: %s -> %s at completed_epoch=%d; "
+                 "gate_parameters=%d, rgb_parameters=%d",
+                 previous, desired, self.epoch, gate_count, rgb_count)
+        return True
+
+    def _adapter_loss(self, obs, cached_targets=None):
+        """Calibrate original visual tokens; never execute the RGB/condition nets."""
+        if cached_targets is not None and "zero_tokens" not in cached_targets:
+            raise ValueError("Adapter calibration requires paired teacher zero_tokens; rebuild this cache")
+        with torch.no_grad():
+            target = (cached_targets["zero_tokens"].to(self.device, non_blocking=True)
+                      if cached_targets is not None else teacher_zero_context_target(self.teacher_policy, obs))
+            prepare = getattr(self.teacher_policy, "prepare_context_inputs_with_future_contact",
+                              self.teacher_policy.prepare_context_inputs)
+            images, _, _, _ = prepare(obs)
+        training = self.model.training and torch.is_grad_enabled()
+        renderer = getattr(self, "_training_model", None) if training else None
+        if renderer is None:
+            renderer = self.model if training else (getattr(self, "ema_model", None) or self.model)
+        with self._autocast():
+            tokens = self.teacher_policy.obs_encoder.encode_image_context(
+                images, context_adapter=lambda context: renderer(image_context=context),
+            )
+            loss = F.mse_loss(tokens.float(), target.float())
+        self.loss_metrics = {
+            "adapter_mse": float(loss.detach()), "token_mse": float(loss.detach()),
+            "loss": float(loss.detach()), "training_stage": "adapter",
+        }
+        return loss
+
+    def _condition_loss(self, obs, cached_targets=None):
+        """Pretrain shared region/alpha features without executing RGB or DINO."""
+        if "contact_alpha" not in obs:
+            raise ValueError("Region/alpha pretraining requires offline dataset contact_alpha labels")
+        teacher = self.teacher_policy
         with self._autocast():
             with torch.no_grad():
                 if cached_targets is not None:
+                    patches = {key: value.to(self.device, non_blocking=True)
+                               for key, value in cached_targets["patch_attention"].items()}
+                else:
+                    _, patches = self._region_targets(obs, return_patch_attention=True)
+                targets = self._region_patch_targets(patches)
+                prepare = getattr(teacher, "prepare_context_inputs_with_future_contact",
+                                  teacher.prepare_context_inputs)
+                images, wrench, _, _ = prepare(obs)
+            training = self.model.training and torch.is_grad_enabled()
+            renderer = getattr(self, "_training_model", None) if training else None
+            if renderer is None:
+                renderer = self.model if training else (getattr(self, "ema_model", None) or self.model)
+            _, masks, prediction = renderer(images, wrench, condition_only=True, return_condition=True)
+            predicted = self._patch_pool(masks)
+            numerator = prediction["contact_alpha"].new_zeros(())
+            denominator = numerator.clone()
+            for key in predicted:
+                # Alpha controls activation. Region learns spatial shape only
+                # where the teacher provides a reliable response distribution.
+                valid = (patches[key].amax(dim=-1) > self.response_noise_floor).float()
+                errors = F.smooth_l1_loss(predicted[key].float(), targets[key].float(),
+                                          reduction="none").mean(dim=-1)
+                numerator = numerator + (valid * errors).sum()
+                denominator = denominator + valid.sum()
+            region_loss = numerator / denominator.clamp_min(1)
+            alpha_mse = F.mse_loss(prediction["contact_alpha"].float(),
+                                   obs["contact_alpha"][:, :teacher.n_obs_steps].float())
+            smoothness = self._intensity_smoothness(masks)
+            loss = (self.context_patch_loss_weight * region_loss
+                    + float(self.distillation_config.get("alpha_loss_weight", 1.0)) * alpha_mse
+                    + self.smoothness_loss_weight * smoothness)
+        self.loss_metrics = {
+            "token_mse": 0.0, "response_mse": 0.0,
+            "response_numerator": 0.0, "response_weight_sum": 0.0,
+            "mask_mse": 0.0, "context_patch_mse": float(region_loss.detach()),
+            "alpha_mse": float(alpha_mse.detach()), "condition_loss": float(loss.detach()),
+            "intensity_smoothness": float(smoothness.detach()),
+            "intensity_loss": float(loss.detach()), "loss": float(loss.detach()),
+            "training_stage": self.training_stage,
+        }
+        return loss
+
+    def _renderer_for_loss(self):
+        training = self.model.training and torch.is_grad_enabled()
+        renderer = getattr(self, "_training_model", None) if training else None
+        return renderer if renderer is not None else (
+            self.model if training else (getattr(self, "ema_model", None) or self.model))
+
+    def _phase_loss_metrics(self, obs, prediction):
+        labels = obs["contact_phase"][:, :self.teacher_policy.n_obs_steps].long()
+        logits = prediction["phase_logits"]
+        predicted = prediction["phase_prediction"]
+        ce = F.cross_entropy(logits.flatten(0, 1), labels.flatten())
+        predicted_open = prediction["contact_alpha"].bool()
+        metrics = {"phase_ce": float(ce.detach()),
+                   "phase_accuracy": float((predicted == labels).float().mean()),
+                   "phase_predicted_open_ratio": float(predicted_open.float().mean())}
+        for phase_id, name in ((0, "free_false_open"), (1, "precontact_recall"), (2, "contact_recall")):
+            selected = labels == phase_id
+            correct = predicted_open if phase_id == 0 else predicted == phase_id
+            metrics[f"phase_{name}_count"] = int(selected.sum())
+            metrics[f"phase_{name}_sum"] = int((correct & selected).sum())
+        return ce, metrics
+
+    def _phase_loss(self, obs):
+        with self._autocast():
+            prediction = self._renderer_for_loss()(phase_only=True, phase_inputs=obs["phase_inputs"])
+            ce, metrics = self._phase_loss_metrics(obs, prediction)
+            loss = self.model.phase_predictor.loss_weight * ce
+        self.loss_metrics = {**metrics, "loss": float(loss.detach()), "training_stage": "phase"}
+        return loss
+
+    def _spatial_intensity_loss(self, obs, cached_targets=None):
+        """Learn the teacher context-effect field without executing the RGB or DINO student path."""
+        with self._autocast():
+            with torch.no_grad():
+                if cached_targets is not None:
+                    patches = {key: value.to(self.device, non_blocking=True)
+                               for key, value in cached_targets["patch_attention"].items()}
+                else:
+                    _, patches = self._region_targets(obs, return_patch_attention=True)
+                targets = self._region_patch_targets(patches)
+                images, wrench, _, _ = self.teacher_policy.prepare_context_inputs(obs)
+            _, masks, prediction = self._renderer_for_loss()(
+                images, wrench, intensity_only=True, phase_inputs=obs["phase_inputs"])
+            predicted = self._patch_pool(masks)
+            patch_loss = torch.stack([
+                F.smooth_l1_loss(predicted[key].float(), targets[key].float())
+                for key in predicted]).mean()
+            smoothness = self._intensity_smoothness(masks)
+            loss = self.context_patch_loss_weight * patch_loss + self.smoothness_loss_weight * smoothness
+            _, phase_metrics = self._phase_loss_metrics(obs, prediction)
+        self.loss_metrics = {**phase_metrics, "context_patch_mse": float(patch_loss.detach()),
+                             "intensity_smoothness": float(smoothness.detach()),
+                             "intensity_loss": float(loss.detach()), "loss": float(loss.detach()),
+                             "training_stage": "intensity"}
+        return loss
+
+    def _loss(self, obs, cached_targets=None, *, action=None):
+        if getattr(self, "training_stage", "joint") == "phase":
+            return self._phase_loss(obs)
+        if self.convergence_stages_enabled and self.training_stage == "intensity":
+            return self._spatial_intensity_loss(obs, cached_targets)
+        if getattr(self, "training_stage", "joint") == "adapter":
+            return self._adapter_loss(obs, cached_targets)
+        if self.condition_prediction_enabled and getattr(self, "training_stage", "joint") == "intensity":
+            return self._condition_loss(obs, cached_targets)
+        # Region targets are used for the warm-up loss and retained as
+        # diagnostics during RGB training and validation.  Model selection
+        # still uses only the primary objective.
+        supervise_regions = (
+            self.attention_enabled and self.model.training and torch.is_grad_enabled()
+            and (not getattr(self, "render_stages_enabled", False)
+                 or getattr(self, "training_stage", "joint") == "intensity")
+        )
+        measure_regions = bool(self.attention_enabled)
+        with self._autocast():
+            with torch.no_grad():
+                target_patches = None
+                target_masks = None
+                if cached_targets is not None:
                     teacher_tokens = cached_targets["tokens"].to(self.device, non_blocking=True)
-                    if supervise_regions:
-                        target_masks = attention_regions(
-                            cached_targets["patch_attention"], obs, self.teacher_policy.obs_encoder.backbone,
-                            self.attention_config["percentiles"],
-                        )
-                elif supervise_regions:
-                    teacher_tokens, target_masks = teacher_attention_targets(
-                        self.teacher_policy, obs, percentiles=self.attention_config["percentiles"],
-                        seed=self.attention_config.get("teacher_seed", 42),
-                        progress_callback=self._attention_progress,
+                    if measure_regions:
+                        target_patches = {
+                            key: value.to(self.device, non_blocking=True)
+                            for key, value in cached_targets["patch_attention"].items()
+                        }
+                        target_masks = self._region_masks(target_patches, obs)
+                elif measure_regions:
+                    teacher_tokens, target_patches = self._region_targets(
+                        obs, return_patch_attention=True,
                     )
+                    target_masks = self._region_masks(target_patches, obs)
                 else:
                     teacher_tokens = self.teacher_policy._encode_context(
                         obs, apply_curriculum_mask=False,
@@ -346,20 +1236,143 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                                 if self.model.training and torch.is_grad_enabled() else None)
             renderer = (getattr(self, "_training_model", None)
                         if self.model.training and torch.is_grad_enabled() else None)
-            student_tokens, masks = student_context_tokens(
-                self.teacher_policy, self.model if renderer is None else renderer, obs,
-                return_aux=True, image_context_encoder=compiled_encoder,
+            if renderer is None:
+                renderer = self.model
+                if not (self.model.training and torch.is_grad_enabled()):
+                    renderer = getattr(self, "ema_model", None)
+                    if renderer is None:
+                        renderer = self.model
+            student_result = student_context_tokens(
+                self.teacher_policy, renderer, obs,
+                return_aux=True, return_contact=True, image_context_encoder=compiled_encoder,
+                use_teacher_ffn=self.use_teacher_ffn,
+                return_condition=self.condition_prediction_enabled or self.phase_prediction_enabled,
             )
+            predicted_condition = None
+            if self.condition_prediction_enabled or self.phase_prediction_enabled:
+                student_tokens, masks, contact_mask, predicted_condition = student_result
+            else:
+                student_tokens, masks, contact_mask = student_result
             if student_tokens.shape != teacher_tokens.shape:
                 raise RuntimeError(f"Token shapes differ: teacher={teacher_tokens.shape}, student={student_tokens.shape}")
             token_mse = F.mse_loss(student_tokens.float(), teacher_tokens.float())
-            mask_mse = (torch.stack([F.mse_loss(masks[key].float(), target_masks[key].float())
-                                     for key in masks]).mean() if supervise_regions else
-                        token_mse.new_zeros(()))
-            loss = token_mse + self.mask_loss_weight * mask_mse if supervise_regions else token_mse
+            response = None
+            response_mse = response_numerator = response_weight_sum = token_mse.new_zeros(())
+            if self.response_loss_weight > 0:
+                response = torch.cat([
+                    target_patches[key] for key in self.teacher_policy.obs_encoder.image_keys
+                ], dim=-1).flatten(1)
+                token_mse, response_mse, response_numerator, response_weight_sum = response_weighted_token_mse(
+                    student_tokens, teacher_tokens, response, noise_floor=self.response_noise_floor,
+                )
+            student_loss = token_mse + self.response_loss_weight * response_mse
+            alpha_mse = token_mse.new_zeros(())
+            if self.condition_prediction_enabled and predicted_condition is not None and "contact_alpha" in obs:
+                alpha_mse = F.mse_loss(predicted_condition["contact_alpha"].float(),
+                                       obs["contact_alpha"][:, :self.teacher_policy.n_obs_steps].float())
+            contact_metrics = self._contact_token_metrics(
+                student_tokens, teacher_tokens, contact_mask,
+            )
+            mask_mse = token_mse.new_zeros(())
+            patch_mse = token_mse.new_zeros(())
+            smoothness = token_mse.new_zeros(())
+            if measure_regions and target_masks is not None:
+                region_context = contextlib.nullcontext() if supervise_regions else torch.no_grad()
+                with region_context:
+                    mask_mse = torch.stack([
+                        F.mse_loss(masks[key].float(), target_masks[key].float())
+                        for key in masks
+                    ]).mean()
+                    smoothness = self._intensity_smoothness(masks)
+                    predicted_patches = self._patch_pool(masks)
+                    target_patch_weights = self._region_patch_targets(target_patches)
+                    patch_losses = []
+                    for key in predicted_patches:
+                        target = target_patch_weights[key].to(
+                            predicted_patches[key].device, predicted_patches[key].dtype,
+                        )
+                        patch_losses.append(F.smooth_l1_loss(predicted_patches[key], target))
+                    patch_mse = torch.stack(patch_losses).mean()
+            denoiser_mse = demo_mse = token_mse.new_zeros(())
+            if self.objective == "denoiser_mse":
+                denoiser_mse, demo_mse = self._denoiser_losses(
+                    action, student_tokens, teacher_tokens.to(student_tokens.dtype),
+                )
+                active_denoiser = (denoiser_mse if self._joint_training_active()
+                                   else denoiser_mse.detach() * 0)
+                loss = (active_denoiser
+                        + float(self.distillation_config.get("token_loss_weight", 0.0)) * token_mse
+                        + float(self.distillation_config.get("demo_loss_weight", 0.0)) * demo_mse)
+            else:
+                loss = student_loss
+            intensity_loss = (
+                float(getattr(self, "context_patch_loss_weight", 1.0)) * patch_mse
+                + float(getattr(self, "intensity_loss_weight", 1.0)) * mask_mse * float(
+                    self.attention_config.get("pixel_loss_weight", 0.0)
+                )
+                + float(getattr(self, "smoothness_loss_weight", 0.02)) * smoothness
+            ) if measure_regions else token_mse.new_zeros(())
+            if not supervise_regions:
+                # Diagnostics must not create a second RGB-stage gradient path.
+                intensity_loss = intensity_loss.detach()
+                mask_mse = mask_mse.detach()
+                patch_mse = patch_mse.detach()
+                smoothness = smoothness.detach()
+            if supervise_regions:
+                loss = loss + intensity_loss
+            if getattr(self, "render_stages_enabled", False) and self.model.training and torch.is_grad_enabled():
+                if getattr(self, "training_stage", "joint") == "intensity":
+                    if not self.attention_enabled:
+                        raise RuntimeError(
+                            "RenderNet intensity stage requires high_attention_render.enabled=true "
+                            "so the teacher context-effect field can supervise the gate"
+                        )
+                    loss = intensity_loss
+                # RGB retains the selected token/DiT objective computed above;
+                # the independently trained condition network stays frozen.
+            phase_metrics = {}
+            if self.phase_prediction_enabled and self.model.phase_predictor.num_classes == 3:
+                # Both prediction heads are frozen during RGB distillation.
+                _, phase_metrics = self._phase_loss_metrics(obs, predicted_condition)
+            elif self.phase_prediction_enabled:
+                labels = fusion_gate_from_phase(obs, self.teacher_policy.n_obs_steps).float()
+                logits = predicted_condition["phase_logits"]
+                phase_bce = F.binary_cross_entropy_with_logits(logits, labels)
+                loss = loss + self.model.phase_predictor.loss_weight * phase_bce
+                predicted_open = predicted_condition["contact_alpha"].bool()
+                phase_metrics = {"phase_bce": float(phase_bce.detach()),
+                                 "phase_accuracy": float((predicted_open == labels.bool()).float().mean()),
+                                 "phase_predicted_open_ratio": float(predicted_open.float().mean())}
+                for phase_id, name in ((0, "free_false_open"), (1, "precontact_recall"), (2, "contact_recall")):
+                    selected = obs["contact_phase"][:, :self.teacher_policy.n_obs_steps] == phase_id
+                    phase_metrics[f"phase_{name}_count"] = int(selected.sum())
+                    phase_metrics[f"phase_{name}_sum"] = int((predicted_open & selected).sum())
             self.loss_metrics = {"token_mse": float(token_mse.detach()),
-                                 "mask_mse": float(mask_mse.detach()), "loss": float(loss.detach()),
-                                 "mask_supervised": supervise_regions}
+                                 "response_mse": float(response_mse.detach()),
+                                 "response_numerator": float(response_numerator.detach()),
+                                 "response_weight_sum": float(response_weight_sum.detach()),
+                                 "student_loss": float(student_loss.detach()),
+                                 "alpha_mse": float(alpha_mse.detach()),
+                                 "denoiser_mse": float(denoiser_mse.detach()),
+                                 "demo_mse": float(demo_mse.detach()),
+                                 "mask_mse": float(mask_mse.detach()),
+                                 "context_patch_mse": float(patch_mse.detach()),
+                                 "intensity_smoothness": float(smoothness.detach()),
+                                 "intensity_loss": float(intensity_loss.detach()),
+                                 "contact_open_ratio": float(contact_metrics["contact_open_ratio"].detach()),
+                                 "open_token_mse": float(contact_metrics["open_token_mse"].detach()),
+                                 "closed_token_mse": float(contact_metrics["closed_token_mse"].detach()),
+                                 "open_token_count": contact_metrics["open_token_count"],
+                                 "closed_token_count": contact_metrics["closed_token_count"],
+                                 "loss": float(loss.detach()),
+                                 "mask_supervised": supervise_regions,
+                                 "mask_measured": measure_regions,
+                                 "joint_training": self._joint_training_active(),
+                                 "training_stage": getattr(self, "training_stage", "joint")}
+            self.loss_metrics.update(self._contact_loss_metrics(
+                obs, student_tokens, teacher_tokens, response=response,
+            ))
+            self.loss_metrics.update(phase_metrics)
         if self.shape_info is None:
             self.shape_info = {
                 "teacher_token_shape": list(teacher_tokens.shape),
@@ -375,15 +1388,117 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             log.info("Token layout: " + json.dumps(self.shape_info))
         return loss
 
+    def _denoiser_losses(self, action, student_tokens, teacher_tokens):
+        if action is None:
+            raise ValueError("denoiser_mse distillation requires batch['action']")
+        teacher = self.teacher_policy
+        action = action.to(self.device, non_blocking=True)
+        if action.ndim != 3 or action.shape[0] != student_tokens.shape[0]:
+            raise ValueError("Distillation actions must have shape [B, horizon, action_dim]")
+        normalized_action = teacher.normalizer["action"].normalize(action)
+        generator = None
+        if not (self.model.training and torch.is_grad_enabled()):
+            generator = getattr(self, "_validation_generator", None)
+            if generator is None:
+                seed = (int(self.distillation_config.get("validation_seed", 42))
+                        + self.distributed_context.rank)
+                generator = torch.Generator(device=self.device).manual_seed(seed)
+        noise = torch.randn(normalized_action.shape, device=self.device,
+                            dtype=normalized_action.dtype, generator=generator)
+        timesteps = torch.randint(
+            0, teacher.noise_scheduler.config.num_train_timesteps,
+            (normalized_action.shape[0],), device=self.device, generator=generator,
+        ).long()
+        noisy_action = teacher.noise_scheduler.add_noise(normalized_action, noise, timesteps)
+        with torch.no_grad():
+            target = teacher.model(noisy_action, timesteps, teacher_tokens)
+        # Frozen parameters must still propagate derivatives w.r.t. context;
+        # no_grad here would sever the RenderNet -> DINO -> DiT gradient path.
+        prediction = teacher.model(noisy_action, timesteps, student_tokens)
+        denoiser_mse = F.mse_loss(prediction.float(), target.float())
+        self._denoiser_per_sample = (
+            prediction.detach().float() - target.detach().float()
+        ).square().flatten(1).mean(1)
+        prediction_type = teacher.noise_scheduler.config.prediction_type
+        if prediction_type == "epsilon":
+            demo_target = noise
+        elif prediction_type == "sample":
+            demo_target = normalized_action
+        elif prediction_type == "v_prediction":
+            demo_target = teacher.noise_scheduler.get_velocity(normalized_action, noise, timesteps)
+        else:
+            raise ValueError(f"unsupported prediction type {prediction_type!r}")
+        return denoiser_mse, F.mse_loss(prediction.float(), demo_target.float())
+
+    @torch.no_grad()
+    def _contact_loss_metrics(self, obs, student_tokens, teacher_tokens, *, response=None):
+        """Measure full outputs of phase=2 anchors; never change the training loss."""
+        phases = obs.get("contact_phase")
+        if phases is None:
+            return {}
+        anchor = getattr(self.teacher_policy, "n_obs_steps", phases.shape[-1]) - 1
+        selected = (phases if phases.ndim == 1 else phases[:, anchor]) == 2
+        errors = (student_tokens.detach().float() - teacher_tokens.detach().float()).square().mean(-1)
+        mask = selected.to(errors.dtype)
+        zero = errors.new_zeros(())
+        numerator = denominator = denoiser_sum = zero
+        if response is not None:
+            weights = (response.detach().float() - self.response_noise_floor).clamp_min(0)
+            weights = weights * mask[:, None]
+            numerator, denominator = (errors * weights).sum(), weights.sum()
+        if self.objective == "denoiser_mse":
+            denoiser_sum = (self._denoiser_per_sample * mask).sum()
+        totals = torch.stack((mask.sum(), (errors.mean(1) * mask).sum(), denoiser_sum,
+                              numerator, denominator)).cpu().tolist()
+        return {**dict(zip(self.contact_total_keys, totals)), **self._contact_means(totals)}
+
+    def _contact_means(self, totals):
+        count, token_sum, denoiser_sum, numerator, weight_sum = totals
+        result = {"contact_samples": int(count)}
+        if count == 0:
+            return result  # Missing measurements must not appear as zero loss.
+        token = token_sum / count
+        response = numerator / max(weight_sum, torch.finfo(torch.float32).eps)
+        result.update(contact_token_mse=token, contact_response_mse=response,
+                      contact_mse=(denoiser_sum / count if self.objective == "denoiser_mse"
+                                   else token + self.response_loss_weight * response))
+        if self.objective == "denoiser_mse":
+            result["contact_denoiser_mse"] = denoiser_sum / count
+        return result
+
     def _token_mse(self, loss):
         # Fallback permits lightweight callers that replace _loss in loop tests.
         return getattr(self, "loss_metrics", {}).get("token_mse", float(loss.detach()))
+
+    @staticmethod
+    def _phase_rates(totals):
+        result = {}
+        for index, name in enumerate(("free_false_open", "precontact_recall", "contact_recall")):
+            numerator, count = totals[index * 2:index * 2 + 2]
+            result[f"phase_{name}"] = numerator / count if count else 0.0
+            result[f"phase_{name}_count"] = int(count)
+        return result
+
+    def _selection_mse(self, loss):
+        if getattr(self, "training_stage", "joint") == "phase":
+            return self.loss_metrics["phase_ce"]
+        if self.convergence_stages_enabled and self.training_stage == "intensity":
+            return self.loss_metrics["intensity_loss"]
+        if getattr(self, "training_stage", "joint") == "adapter":
+            return getattr(self, "loss_metrics", {}).get("adapter_mse", float(loss.detach()))
+        if self.condition_prediction_enabled and getattr(self, "training_stage", "joint") == "intensity":
+            return getattr(self, "loss_metrics", {}).get("condition_loss", float(loss.detach()))
+        if self.response_loss_weight > 0:
+            return getattr(self, "loss_metrics", {}).get("student_loss", float(loss.detach()))
+        return getattr(self, "loss_metrics", {}).get(self.objective, float(loss.detach()))
 
     def _obs(self, batch):
         return dict_apply(batch["obs"], lambda value: value.to(self.device, non_blocking=True))
 
     def _batch_loss(self, batch):
         obs = self._obs(batch)
+        if self.objective == "denoiser_mse":
+            return self._loss(obs, cached_targets=batch.get("teacher_targets"), action=batch.get("action"))
         if "teacher_targets" in batch:
             return self._loss(obs, cached_targets=batch["teacher_targets"])
         return self._loss(obs)
@@ -437,6 +1552,8 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             "checkpoint": {"path": str(checkpoint), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns},
             "state_key": self.teacher_state_key,
             "policy": OmegaConf.to_container(self.teacher_cfg.policy, resolve=True),
+            "wrench_preprocessing_version": WRENCH_PREPROCESSING_VERSION,
+            "future_contact_mode": getattr(self.teacher_policy, "future_contact_mode", "legacy_rollout"),
             "dataset": OmegaConf.to_container(dataset_cfg, resolve=True),
             "source": dataset_source_signature(dataset.dataset_path),
             "amp_enabled": self.amp_enabled, "amp_dtype": str(self.amp_dtype),
@@ -445,9 +1562,28 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             "attention_seed": int(self.attention_config.get("teacher_seed", 42)),
             "cache_batch_size": int(config["batch_size"]),
         }
-        # Keep the identity of existing float32 caches; FP16 gets a distinct path.
+        # Storage precision is separate from the preprocessing/fusion contract.
         if token_dtype != "float32":
             identity["token_storage_dtype"] = token_dtype
+        precision = config.get("precision", "model")
+        if precision not in {"model", "float32"}:
+            raise ValueError("teacher_cache.precision must be model or float32")
+        if precision != "model":
+            identity["target_precision"] = precision
+        region_source = None
+        if self.attention_enabled:
+            region_source = getattr(
+                self, "region_source",
+                normalize_region_source(self.attention_config.get("source", "noise_attention")),
+            )
+            identity["region_source"] = (
+                "context_effect_v2" if region_source == "context" else "noise_attention_v1"
+            )
+        if self.attention_enabled and region_source == "context":
+            identity["context_effect_baseline"] = self.attention_config.get("baseline", "raw_zero")
+            identity["context_effect_precision"] = "float32"
+        if self.context_adapter_enabled:
+            identity["paired_zero_context"] = "raw_zero_v1"
         for name, source in (("train", dataset), ("validation", validation_dataset)):
             indices = np.ascontiguousarray(source.indices)
             identity[name] = {"samples": len(source), "indices_shape": list(indices.shape),
@@ -507,20 +1643,27 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                                         initial=cache.completed, unit="sample") as progress:
                         for batch in self._iterate_loader(loader):
                             obs = self._obs(batch)
-                            with self._autocast():
-                                if self.attention_enabled:
-                                    tokens, attention = teacher_attention_targets(
-                                        self.teacher_policy, obs, percentiles=self.attention_config["percentiles"],
-                                        seed=self.attention_config.get("teacher_seed", 42),
-                                        progress_callback=self._attention_progress, return_patch_attention=True,
+                            amp = (torch.autocast(device_type=self.device.type, enabled=False)
+                                   if config.get("precision", "model") == "float32" else self._autocast())
+                            with amp:
+                                zero_tokens = None
+                                if self.context_adapter_enabled and self.attention_enabled and self.region_source == "context":
+                                    tokens, attention, zero_tokens = teacher_context_effect_targets(
+                                        self.teacher_policy, obs, return_zero=True,
                                     )
+                                elif self.attention_enabled:
+                                    tokens, attention = self._region_targets(obs, return_patch_attention=True)
                                 else:
                                     tokens = self.teacher_policy._encode_context(obs, apply_curriculum_mask=False).detach()
                                     attention = {}
-                            cache.append(tokens, attention)
+                                if self.context_adapter_enabled and zero_tokens is None:
+                                    zero_tokens = teacher_zero_context_target(self.teacher_policy, obs)
+                            cache.append(tokens, attention, **({"zero_tokens": zero_tokens}
+                                                              if zero_tokens is not None else {}))
                             progress.update(len(tokens))
                             now = time.monotonic()
-                            if cache.completed == start_count + len(tokens) or cache.complete or now - last_log >= 30:
+                            if (not self._progress_enabled()
+                                    and now - last_log >= self._status_interval()):
                                 elapsed = now - started
                                 rate = (cache.completed - start_count) / max(elapsed, 1e-6)
                                 log.info(f"Teacher cache {name}: {cache.completed}/{len(source)}, "
@@ -528,6 +1671,8 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                                          f"ETA={(len(source) - cache.completed) / max(rate, 1e-6):.1f}s; "
                                          f"token_shape={list(tokens.shape)}")
                                 last_log = now
+                    log.info("Teacher cache %s ready: %d samples, %.1fs", name, cache.completed,
+                             time.monotonic() - started)
                 prepared.append(CachedTeacherDataset(source, cache))
         if self.is_main_process:
             manifest_path = pathlib.Path(self.output_dir, "teacher_cache.json")
@@ -551,6 +1696,35 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                      "DataLoader workers share the read-only arrays")
         log.info("Complete teacher cache ready; training/validation will read cached targets")
         return tuple(prepared)
+
+    def _select_phase_dataset(self, dataset, *, split):
+        """Select complete windows by measured anchor phase, after cache indexing.
+
+        Historical observations and the full action horizon stay intact. The
+        predicted alpha and future-contact masks do not select training data.
+        """
+        if self.sample_phases is None:
+            return dataset
+        source = dataset.dataset if isinstance(dataset, CachedTeacherDataset) else dataset
+        get_labels = getattr(source, "get_phase_labels", None)
+        if not callable(get_labels):
+            raise ValueError("training.sample_phases requires dataset.get_phase_labels()")
+        labels = np.asarray(get_labels())
+        if labels.shape != (len(dataset),) or not np.isin(labels, (0, 1, 2)).all():
+            raise ValueError("Dataset anchor phase labels must align with the complete sample/cache indices")
+        indices = np.flatnonzero(np.isin(labels, self.sample_phases))
+        if not len(indices):
+            raise ValueError(f"No {split} samples in selected anchor phases {self.sample_phases}")
+        if not hasattr(self, "phase_selection"):
+            self.phase_selection = {}
+        self.phase_selection[split] = {
+            "phases": list(self.sample_phases), "total_samples": len(dataset),
+            "selected_samples": len(indices),
+            "source_phase_counts": {str(p): int((labels == p).sum()) for p in (0, 1, 2)},
+        }
+        log.info("%s phase selection: anchor phases=%s, %d/%d samples; original cache indices retained",
+                 split, self.sample_phases, len(indices), len(dataset))
+        return Subset(dataset, indices.tolist())
 
     def _loader(self, dataset, config, *, validation=False):
         kwargs = OmegaConf.to_container(config, resolve=True)
@@ -598,29 +1772,56 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
 
     @torch.no_grad()
     def _validate(self, loader):
+        with self._validation_probes():
+            return self._validate_batches(loader)
+
+    def _validate_batches(self, loader):
         self.model.eval()
+        if getattr(self, "ema_model", None) is not None:
+            self.ema_model.eval()
         total, count = 0.0, 0
-        started = time.monotonic()
+        component_keys = (
+            "token_mse", "denoiser_mse", "demo_mse", "mask_mse",
+            "context_patch_mse", "intensity_smoothness", "intensity_loss",
+            "contact_open_ratio", "response_mse", "student_loss", "alpha_mse", "condition_loss", "adapter_mse", "loss",
+            "phase_bce", "phase_ce", "phase_accuracy", "phase_predicted_open_ratio",
+        )
+        component_totals = {key: 0.0 for key in component_keys}
+        contact_totals = np.zeros(len(self.contact_total_keys), dtype=np.float64)
+        phase_totals = np.zeros(len(self.phase_total_keys), dtype=np.float64)
+        response_numerator = response_weight_sum = 0.0
+        open_token_sum = closed_token_sum = open_token_count = closed_token_count = 0.0
+        started = last_status = time.monotonic()
         batches = len(loader)
         if self.max_val_batches is not None:
             batches = min(batches, int(self.max_val_batches))
-        log.info(f"Validation started: epoch={self.epoch}, batches={batches}; "
-                 "token MSE only, no teacher denoising/attention capture")
         progress = self._progress(itertools.islice(self._iterate_loader(loader), batches),
-                                  f"Validation epoch {self.epoch}", batches)
+                                  f"Val {self.epoch}", batches)
         for index, batch in enumerate(progress):
             loss = self._batch_loss(batch)
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Non-finite validation MSE at step {self.global_step}")
             size = next(iter(batch["obs"].values())).shape[0]
-            total += self._token_mse(loss) * size
+            total += self._selection_mse(loss) * size
+            for key in component_totals:
+                component_totals[key] += getattr(self, "loss_metrics", {}).get(key, 0.0) * size
+            metrics = getattr(self, "loss_metrics", {})
+            contact_totals += [metrics.get(key, 0.0) for key in self.contact_total_keys]
+            phase_totals += [metrics.get(key, 0.0) for key in self.phase_total_keys]
+            response_numerator += metrics.get("response_numerator", 0.0)
+            response_weight_sum += metrics.get("response_weight_sum", 0.0)
+            open_token_sum += metrics.get("open_token_mse", 0.0) * metrics.get("open_token_count", 0.0)
+            closed_token_sum += metrics.get("closed_token_mse", 0.0) * metrics.get("closed_token_count", 0.0)
+            open_token_count += metrics.get("open_token_count", 0.0)
+            closed_token_count += metrics.get("closed_token_count", 0.0)
             count += size
             progress.set_postfix(mse=f"{total / count:.6f}", refresh=False)
-            if index == 0 or (index + 1) % 10 == 0 or index + 1 == batches:
-                elapsed = time.monotonic() - started
-                log.info(f"Validating epoch={self.epoch}: batches={index + 1}/{batches}, "
-                         f"samples={count}, mse={total / count:.8f}, elapsed={elapsed:.1f}s, "
-                         f"ETA={(batches - index - 1) * elapsed / (index + 1):.1f}s")
+            now = time.monotonic()
+            if not self._progress_enabled() and self.is_main_process and now - last_status >= self._status_interval():
+                log.info("Val %d | batch=%d/%d mse=%.6f elapsed=%.1fs",
+                         self.epoch, index + 1, batches, total / count, now - started)
+                last_status = now
+        progress.close()
         total, count = self._sum([total, count])
         count = int(count)
         if count == 0:
@@ -628,6 +1829,34 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         self.validation_samples = count
         self.validation_seconds = self._max_seconds(time.monotonic() - started)
         self.validation_samples_per_second = count / max(self.validation_seconds, 1e-6)
+        totals = self._sum(list(component_totals.values()) + [
+            open_token_sum, closed_token_sum, open_token_count, closed_token_count,
+        ] + contact_totals.tolist())
+        component_count = len(component_totals)
+        self.validation_metrics = {
+            key: value / count for key, value in zip(component_totals, totals[:component_count])
+        }
+        open_sum, closed_sum, open_count, closed_count = totals[component_count:component_count + 4]
+        self.validation_metrics.update(self._contact_means(totals[component_count + 4:]))
+        if self.phase_prediction_enabled:
+            self.validation_metrics.update(self._phase_rates(self._sum(phase_totals.tolist())))
+        self.validation_metrics["open_token_mse"] = open_sum / open_count if open_count else 0.0
+        self.validation_metrics["closed_token_mse"] = closed_sum / closed_count if closed_count else 0.0
+        self.validation_metrics["open_token_count"] = open_count
+        self.validation_metrics["closed_token_count"] = closed_count
+        if self.response_loss_weight > 0 and self.training_stage not in {"adapter", "phase"} and not (
+                (self.condition_prediction_enabled or self.convergence_stages_enabled)
+                and self.training_stage == "intensity"):
+            response_numerator, response_weight_sum = self._sum([response_numerator, response_weight_sum])
+            self.validation_metrics["response_mse"] = (
+                response_numerator / response_weight_sum if response_weight_sum > 0 else 0.0
+            )
+            self.validation_metrics["response_weight_sum"] = response_weight_sum
+            self.validation_metrics["student_loss"] = (
+                self.validation_metrics["token_mse"]
+                + self.response_loss_weight * self.validation_metrics["response_mse"]
+            )
+            return self.validation_metrics["student_loss"]
         return total / count
 
     def _summary(self, status):
@@ -636,23 +1865,54 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         summary = {
             "status": status, "global_step": self.global_step,
             "epoch": self.epoch, "max_epochs": self.num_epochs,
+            "intensity_warmup_epochs": self.intensity_warmup_epochs,
+            "render_stages": {
+                "enabled": self.render_stages_enabled,
+                "transition": self.cfg.training.get("render_stages", {}).get("transition", "epoch"),
+                "intensity_epochs": self.intensity_epochs,
+                "adapter_enabled": self.context_adapter_enabled,
+                "adapter_epochs": getattr(self, "adapter_epochs", 0),
+                "current_stage": self.training_stage,
+                "stage_step": self.stage_step,
+                "stage_epoch": self.stage_epoch,
+                "transition_reason": self.stage_transition_reason,
+            },
             "max_steps": self.max_steps, "stop_reason": self.stop_reason,
             "best_epoch": self.best_epoch, "best_step": self.best_step,
             "early_stopping": {"enabled": self.early_stopping_enabled,
                                "patience_epochs": self.patience, "min_delta": self.min_delta,
+                               "start_at_rgb": bool(self.cfg.training.early_stopping.get("start_at_rgb", False)),
+                               "counting_active": self._early_stopping_active(),
                                "epochs_without_improvement": self.epochs_without_improvement},
             "teacher_checkpoint": str(pathlib.Path(self.cfg.teacher_checkpoint).resolve()),
             "teacher_state_key": self.teacher_state_key, "cross_attn_query": "image",
+            "student_state_key": self.evaluation_state_key,
+            "ema": self.ema.state_dict() if self.ema is not None else None,
+            "lr": self.optimizer.param_groups[0]["lr"],
+            "lr_scheduler": (self.lr_scheduler.state_dict()
+                             if self.lr_scheduler is not None and self.validation_enabled else None),
             "wrench_preprocessing": OmegaConf.to_container(self.cfg.wrench_preprocessing, resolve=True),
             "render_net": OmegaConf.to_container(self.cfg.render_net, resolve=True),
             "validation_enabled": self.validation_enabled,
-            "validation_metric": "context token MSE (excludes mask loss)" if self.validation_enabled else None,
+            "metric_scope": self.metric_scope,
+            "phase_selection": getattr(self, "phase_selection", None),
+            "distillation": OmegaConf.to_container(OmegaConf.create(self.distillation_config), resolve=True),
+            "objective": self.logging_objective,
+            "validation_metric": f"{self.metric_name} (excludes auxiliary losses)" if self.validation_enabled else None,
             "teacher_cache": getattr(self, "teacher_cache_paths", None),
             "world_size": self.distributed_context.world_size,
+            "batching": {
+                "train_per_rank": getattr(self, "train_batch_size", None),
+                "train_global": getattr(self, "train_global_batch_size", None),
+                "train_batches_per_epoch": getattr(self, "train_batches_per_epoch", None),
+                "validation_per_rank": getattr(self, "val_batch_size", None),
+                "validation_batches": getattr(self, "val_batches", None),
+            },
             "teacher_trainable_parameters": sum(p.numel() for p in self.teacher_policy.parameters() if p.requires_grad),
             "student_trainable_parameters": sum(p.numel() for p in self.model.parameters() if p.requires_grad),
             "initial_train_mse": self.initial_train_mse, "initial_val_mse": self.initial_val_mse,
             "latest_val_mse": self.latest_val_loss,
+            "latest_validation_metrics": getattr(self, "validation_metrics", {}),
             "best_val_mse": self.best_val_loss if self.validation_enabled else None,
             "validation_samples": getattr(self, "validation_samples", 0),
             "best_checkpoint": str(self.get_checkpoint_path("best").resolve()) if self.validation_enabled else None,
@@ -663,12 +1923,72 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         }
         pathlib.Path(self.output_dir, "training_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
 
+    def _log_initial_losses(self, train_dataset, val_loader, logger):
+        """Evaluate full splits before updates, including every contact anchor."""
+        log.info("Initial %s evaluation: complete training split and validation split", self.training_stage)
+        baseline_cfg = copy.deepcopy(self.cfg.val_dataloader)
+        with open_dict(baseline_cfg):
+            baseline_cfg.shuffle = False
+            baseline_cfg.drop_last = False
+        previous_limit = self.max_val_batches
+        saved_validation = {key: value for key, value in self.__dict__.items()
+                            if key.startswith("validation_")}
+        self.max_val_batches = None
+        loader = self._loader(train_dataset, baseline_cfg, validation=True)
+        try:
+            self.initial_train_mse = self._validate(loader)
+            initial_metrics = dict(self.validation_metrics)
+            initial_samples = self.validation_samples
+        finally:
+            if getattr(loader, "_iterator", None) is not None:
+                loader._iterator._shutdown_workers()
+            self.max_val_batches = previous_limit
+            for key in list(self.__dict__):
+                if key.startswith("validation_") and key not in saved_validation:
+                    delattr(self, key)
+            self.__dict__.update(saved_validation)
+        metadata = {"global_step": self.global_step, "epoch": self.epoch,
+                    "objective": self.logging_objective, "training_stage": self.training_stage,
+                    "metric_scope": self.metric_scope,
+                    "student_state_key": self.evaluation_state_key,
+                    "response_loss_weight": self.response_loss_weight}
+        logger.log({**metadata, "initial_train_mse": self.initial_train_mse,
+                    "initial_train_samples": initial_samples,
+                    **{f"initial_train_{key}": value for key, value in initial_metrics.items()},
+                    "lr": self.optimizer.param_groups[0]["lr"],
+                    "elapsed_seconds": time.monotonic() - self.started_at, **self._gpu_metrics()})
+        if val_loader is not None:
+            self.initial_val_mse = self._validate(val_loader)
+            self.latest_val_loss = self.best_val_loss = self.initial_val_mse
+            self.best_epoch, self.best_step = self.epoch, self.global_step
+            self.early_stopping_best_loss = self.initial_val_mse
+            self._step_lr_scheduler(self.initial_val_mse)
+            if self.is_main_process:
+                self.save_checkpoint(tag="best", use_thread=False)
+                if self.convergence_stages_enabled:
+                    self.save_checkpoint(tag=f"best_{self.training_stage}", use_thread=False)
+                if self.training_stage == "adapter":
+                    self.save_checkpoint(tag="best_adapter", use_thread=False)
+                if self.condition_prediction_enabled and self.training_stage == "intensity":
+                    self.save_checkpoint(tag="best_condition", use_thread=False)
+            logger.log({**metadata, "initial_val_mse": self.initial_val_mse,
+                        "initial_val_samples": self.validation_samples,
+                        **{f"initial_val_{key}": value for key, value in self.validation_metrics.items()},
+                        "val_seconds": self.validation_seconds,
+                        "elapsed_seconds": time.monotonic() - self.started_at})
+        logger.save_plot()
+
     def _validate_and_save(self, loader, logger):
         if loader is None:
             return False
         self.latest_val_loss = self._validate(loader)
+        self._step_lr_scheduler(self.latest_val_loss)
         improved = self.latest_val_loss < self.best_val_loss
-        if self.latest_val_loss < self.early_stopping_best_loss - self.min_delta:
+        if not self._early_stopping_active():
+            # Gate warm-up keeps the RGB output at its identity initialization,
+            # so token MSE cannot measure gate progress during these epochs.
+            self.epochs_without_improvement = 0
+        elif self.latest_val_loss < self.early_stopping_best_loss - self._stage_min_delta():
             self.early_stopping_best_loss = self.latest_val_loss
             self.epochs_without_improvement = 0
         else:
@@ -679,51 +1999,83 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             self.best_step = self.global_step
             if self.is_main_process:
                 self.save_checkpoint(tag="best", use_thread=False)
-            log.info(f"New best checkpoint: {self.get_checkpoint_path('best')} "
-                     f"(epoch={self.epoch}, val_mse={self.best_val_loss:.8f})")
+                if self.convergence_stages_enabled:
+                    self.save_checkpoint(tag=f"best_{self.training_stage}", use_thread=False)
+                if self.training_stage == "adapter":
+                    self.save_checkpoint(tag="best_adapter", use_thread=False)
+                if self.condition_prediction_enabled and self.training_stage == "intensity":
+                    self.save_checkpoint(tag="best_condition", use_thread=False)
         metrics = {"global_step": self.global_step, "epoch": self.epoch,
+                   "objective": self.logging_objective,
+                   "training_stage": getattr(self, "training_stage", "joint"),
+                   "student_state_key": self.evaluation_state_key,
+                   "val_per_rank_batch_size": getattr(self, "val_batch_size", None),
+                   "val_global_batch_size": (
+                       getattr(self, "val_batch_size", 0) * self.distributed_context.world_size
+                       if getattr(self, "val_batch_size", None) is not None else None
+                   ),
+                   "lr": self.optimizer.param_groups[0]["lr"],
                    "val_mse": self.latest_val_loss, "best_val_mse": self.best_val_loss,
                    "epochs_without_improvement": self.epochs_without_improvement,
                    "val_seconds": getattr(self, "validation_seconds", 0.0),
                    "val_samples_per_second": getattr(self, "validation_samples_per_second", 0.0),
                    "elapsed_seconds": time.monotonic() - self.started_at, **self._gpu_metrics()}
+        metrics.update({f"val_{key}": value for key, value in getattr(self, "validation_metrics", {}).items()})
         logger.log(metrics)
         logger.save_plot()
-        log.info(f"epoch={self.epoch}/{self.num_epochs} step={self.global_step} "
-              f"val_mse={self.latest_val_loss:.8f} best={self.best_val_loss:.8f} "
-              f"samples={self.validation_samples} stale_epochs={self.epochs_without_improvement}/{self.patience}")
         self._summary("running")
-        return self.early_stopping_enabled and self.epochs_without_improvement >= self.patience
+        patience = self._stage_patience()
+        if self.training_stage == "adapter":
+            patience = int(self.cfg.training.get("render_stages", {}).get("adapter_patience", patience))
+        if self.condition_prediction_enabled and self.training_stage == "intensity":
+            patience = int(self.cfg.training.get("render_stages", {}).get("condition_patience", patience))
+        return (self.early_stopping_enabled and self._early_stopping_active()
+                and self.epochs_without_improvement >= patience)
 
     def run(self):
         cache_config = self.cfg.get("teacher_cache", {})
-        with TeacherCacheLifecycle(cleanup_on_exit=cache_config.get("cleanup_on_exit", True)) as lifetime:
+        with logging_redirect_tqdm(), TeacherCacheLifecycle(
+                cleanup_on_exit=cache_config.get("cleanup_on_exit", True)) as lifetime:
             self._teacher_cache_lifetime = lifetime
             try:
                 return self._run()
             finally:
                 self._teacher_cache_lifetime = None
 
+    def _dataset_config(self):
+        # Use the supplied teacher YAML for data paths/windows; the checkpoint
+        # remains the source of the model architecture and fitted normalizer.
+        source = self.teacher_source_cfg if self.teacher_source_cfg is not None else self.teacher_cfg
+        config = OmegaConf.create(OmegaConf.to_container(source.task.dataset, resolve=True))
+        with open_dict(config):
+            config.update(OmegaConf.to_container(self.cfg.dataset, resolve=True))
+            if hasattr(self, "wrench_preprocessor"):
+                config.contact_label_config = self.wrench_preprocessor.get_config()
+                with open_dict(self.cfg.dataset):
+                    self.cfg.dataset.contact_label_config = config.contact_label_config
+            if self.phase_prediction_enabled:
+                config.phase_predictor = self.cfg.render_net.phase_predictor
+                with open_dict(self.cfg.dataset):
+                    self.cfg.dataset.phase_predictor = config.phase_predictor
+        return canonical_dataset_config(config)
+
     def _run(self):
+        dataset_cfg = self._dataset_config()
         output = pathlib.Path(self.output_dir)
         output.mkdir(parents=True, exist_ok=True)
         if self.is_main_process:
             OmegaConf.save(self.cfg, output / "config.yaml", resolve=True)
             OmegaConf.save(self.teacher_cfg, output / "teacher_config.yaml", resolve=True)
+            if self.teacher_source_cfg is not None:
+                OmegaConf.save(self.teacher_source_cfg, output / "teacher_source_config.yaml", resolve=True)
             # Continuing in a new directory preserves the previously best model.
             if self.resume_from:
-                previous_best = pathlib.Path(self.resume_from).parent / "best.ckpt"
-                destination = self.get_checkpoint_path("best")
-                if previous_best.is_file() and not destination.exists():
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(previous_best, destination)
-        dataset_cfg = copy.deepcopy(self.teacher_cfg.task.dataset)
-        # Resolve teacher-root interpolations before applying distillation overrides.
-        dataset_cfg = OmegaConf.create(OmegaConf.to_container(dataset_cfg, resolve=True))
-        with open_dict(dataset_cfg):
-            if self.cfg.get("dataset_path"):
-                dataset_cfg.dataset_path = str(self.cfg.dataset_path)
-            dataset_cfg.update(OmegaConf.to_container(self.cfg.dataset, resolve=True))
+                for tag in ("best", "best_phase", "best_intensity", "best_rgb", "best_condition", "best_adapter"):
+                    previous_best = pathlib.Path(self.resume_from).parent / f"{tag}.ckpt"
+                    destination = self.get_checkpoint_path(tag)
+                    if previous_best.is_file() and not destination.exists():
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(previous_best, destination)
         # Keep the original dataset config as the cache identity. Rank-local
         # decoder devices do not change supervision, so all ranks reuse the
         # existing single-GPU teacher cache rather than creating new copies.
@@ -732,14 +2084,21 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             runtime_dataset_cfg.video_decode_device = str(self.device) if self.device.type == "cuda" else "auto"
         dataset = self._instantiate_dataset(runtime_dataset_cfg)
         validation_dataset = dataset.get_validation_dataset()
+        if self.phase_prediction_enabled and not bool(self.model.phase_predictor.normalizer_fitted):
+            self.model.phase_predictor.fit_normalizer(dataset.phase_training_states())
+            if self.ema_model is not None:
+                self.ema_model.phase_predictor.load_state_dict(self.model.phase_predictor.state_dict())
         if not len(dataset):
             dataset.lerobot_dataset.close()
             raise RuntimeError("Distillation needs a nonempty training split")
         self.validation_enabled = len(validation_dataset) > 0
+        if self.convergence_stages_enabled and not self.validation_enabled:
+            dataset.lerobot_dataset.close()
+            raise ValueError("Three-stage convergence requires a nonempty validation split")
         if not self.validation_enabled:
             self.early_stopping_enabled = False
             log.info("No validation split: train on all episodes until the epoch/step limit; "
-                     "validation, early stopping and best checkpoint selection are disabled. "
+                     "validation, LR scheduling, early stopping and best checkpoint selection are disabled. "
                      "Save latest.ckpt after each epoch.")
         log.info(f"Dataset: train={len(dataset)}, validation={len(validation_dataset)}; "
               "normalizer=teacher checkpoint (not refitted)")
@@ -751,9 +2110,17 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                 if self.distributed_context.enabled:
                     dist.barrier()
                 return
+            train_dataset = self._select_phase_dataset(train_dataset, split="train")
+            if self.validation_enabled:
+                validation_dataset = self._select_phase_dataset(validation_dataset, split="validation")
             train_loader = self._loader(train_dataset, self.cfg.dataloader)
             val_loader = (self._loader(validation_dataset, self.cfg.val_dataloader, validation=True)
                           if self.validation_enabled else None)
+            self.train_batch_size = int(train_loader.batch_size)
+            self.train_global_batch_size = int(train_loader.batch_size * self.distributed_context.world_size)
+            self.train_batches_per_epoch = int(len(train_loader))
+            self.val_batch_size = int(val_loader.batch_size) if val_loader is not None else None
+            self.val_batches = int(len(val_loader)) if val_loader is not None else 0
             self._setup_acceleration()
             self._setup_distributed_model()
             runtime_seed = int(self.cfg.training.seed) + self.distributed_context.rank
@@ -766,45 +2133,28 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                      train_loader.batch_size * self.distributed_context.world_size,
                      "SSD mmap" if not cache_config.get("load_into_ram", False) else "RAM",
                      getattr(dataset, "load_result_cache_path", None) or "process RAM")
+            log.info("Loader lengths: train=%d batches/epoch; validation=%d batches; "
+                     "configured batch=%d/%s",
+                     self.train_batches_per_epoch, self.val_batches,
+                     self.train_global_batch_size,
+                     self.val_batch_size if self.val_batch_size is not None else "disabled")
             logging_config = self.cfg.get("logging", {})
             logger_context = (RenderNetTrainingLogger(output, logging_config.get("plot_every_steps", 100))
                               if self.is_main_process else contextlib.nullcontext(_NullTrainingLogger()))
             with logger_context as logger:
+                if self.sample_phases is not None:
+                    logger.log({"global_step": self.global_step, "epoch": self.epoch,
+                                "metric_scope": self.metric_scope})
                 if self.is_main_process:
                     log.info(f"Local metrics: {logger.path}; PNG: {output / 'training_metrics.png'}")
                 if self.resume_from is None:
-                    self.model.eval()
-                    log.info(f"Initial evaluation started: one training batch "
-                             f"(batch_size={self.cfg.dataloader.batch_size}); validation={self.validation_enabled}")
-                    with torch.no_grad():
-                        initial_batch = next(self._iterate_loader(train_loader))
-                        initial_loss = self._batch_loss(initial_batch)
-                        size = next(iter(initial_batch["obs"].values())).shape[0]
-                        total, count = self._sum([self._token_mse(initial_loss) * size, size])
-                        self.initial_train_mse = total / count
-                    log.info(f"Initial training batch complete: token_mse={self.initial_train_mse:.8f}")
-                    logger.log({"global_step": 0, "epoch": 0, "initial_train_mse": self.initial_train_mse,
-                                "lr": self.optimizer.param_groups[0]["lr"],
-                                "elapsed_seconds": time.monotonic() - self.started_at, **self._gpu_metrics()})
-                    logger.save_plot()
-                    if self.validation_enabled:
-                        self.initial_val_mse = self._validate(val_loader)
-                        self.latest_val_loss = self.initial_val_mse
-                        self.best_val_loss = self.initial_val_mse
-                        self.early_stopping_best_loss = self.initial_val_mse
-                        if self.is_main_process:
-                            self.save_checkpoint(tag="best", use_thread=False)
-                        log.info(f"Initial train_mse={self.initial_train_mse:.8f}, val_mse={self.initial_val_mse:.8f}")
-                        logger.log({"global_step": 0, "epoch": 0, "initial_train_mse": self.initial_train_mse,
-                                    "initial_val_mse": self.initial_val_mse,
-                                    "val_seconds": getattr(self, "validation_seconds", 0.0),
-                                    "val_samples_per_second": getattr(self, "validation_samples_per_second", 0.0),
-                                    "elapsed_seconds": time.monotonic() - self.started_at, **self._gpu_metrics()})
-                        logger.save_plot()
+                    self._log_initial_losses(train_dataset, val_loader, logger)
                 else:
                     log.info("Skipping initial evaluation; restored checkpoint state will be continued")
                 self._summary("running")
                 for epoch_index in range(self.epoch, self.num_epochs):
+                    if self._maybe_transition_stage(completed_epochs=self.epoch):
+                        self._log_initial_losses(train_dataset, val_loader, logger)
                     if self.max_steps is not None and self.global_step >= int(self.max_steps):
                         self.stop_reason = "max_steps"
                         break
@@ -813,19 +2163,33 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                     epoch_number = epoch_index + 1
                     epoch_total, epoch_samples = 0.0, 0
                     epoch_loss_total = epoch_mask_total = 0.0
-                    epoch_started = previous_end = time.monotonic()
+                    epoch_components = {key: 0.0 for key in (
+                        "token_mse", "denoiser_mse", "demo_mse", "context_patch_mse",
+                        "intensity_smoothness", "intensity_loss", "contact_open_ratio",
+                        "response_mse", "student_loss", "alpha_mse", "condition_loss", "adapter_mse",
+                        "phase_bce", "phase_ce", "phase_accuracy", "phase_predicted_open_ratio",
+                    )}
+                    epoch_open_token_sum = epoch_closed_token_sum = 0.0
+                    epoch_open_token_count = epoch_closed_token_count = 0.0
+                    epoch_contact_totals = np.zeros(len(self.contact_total_keys), dtype=np.float64)
+                    epoch_phase_totals = np.zeros(len(self.phase_total_keys), dtype=np.float64)
+                    epoch_started = previous_end = last_status = time.monotonic()
                     batches = len(train_loader)
                     if self.max_steps is not None:
                         batches = min(batches, int(self.max_steps) - self.global_step)
                     progress = self._progress(itertools.islice(self._iterate_loader(train_loader), batches),
-                                              f"Training epoch {epoch_number}/{self.num_epochs}", batches)
-                    log.info(f"Training epoch={epoch_number}/{self.num_epochs} started: batches={batches}, "
-                             f"per_rank_batch_size={train_loader.batch_size}, lr={self.optimizer.param_groups[0]['lr']:.3g}")
-                    self.model.train()
+                                              f"Train {epoch_number}/{self.num_epochs}", batches)
+                    if hasattr(self.model, "set_stage_mode"):
+                        self.model.set_stage_mode(True)
+                    else:
+                        self.model.train()
                     for batch_index, batch in enumerate(progress):
                         step_started = time.monotonic()
                         data_seconds = step_started - previous_end
-                        self.model.train()
+                        if hasattr(self.model, "set_stage_mode"):
+                            self.model.set_stage_mode(True)
+                        else:
+                            self.model.train()
                         self.optimizer.zero_grad(set_to_none=True)
                         loss = self._batch_loss(batch)
                         if not torch.isfinite(loss):
@@ -835,61 +2199,135 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                         grad_norm = torch.nn.utils.clip_grad_norm_(
                             self.model.parameters(), float(self.cfg.training.max_grad_norm), error_if_nonfinite=True,
                         )
+                        scale_before = self.grad_scaler.get_scale()
                         self.grad_scaler.step(self.optimizer)
                         self.grad_scaler.update()
+                        if self.ema is not None and self.grad_scaler.get_scale() >= scale_before:
+                            self.ema.step(self.model)
                         grad_norm_value = float(grad_norm)
                         step_seconds = time.monotonic() - step_started
                         self.global_step += 1
+                        self.stage_step += 1
                         size = next(iter(batch["obs"].values())).shape[0]
-                        token_total, loss_total, mask_total, global_size = self._sum([
-                            self._token_mse(loss) * size, float(loss.detach()) * size,
+                        metrics_for_batch = self.loss_metrics
+                        epoch_phase_totals += [metrics_for_batch.get(key, 0.0) for key in self.phase_total_keys]
+                        open_count = metrics_for_batch.get("open_token_count", 0.0)
+                        closed_count = metrics_for_batch.get("closed_token_count", 0.0)
+                        primary_total, loss_total, mask_total, global_size, *component_totals = self._sum([
+                            self._selection_mse(loss) * size, float(loss.detach()) * size,
                             self.loss_metrics.get("mask_mse", 0.0) * size, size,
+                            *[self.loss_metrics.get(key, 0.0) * size for key in epoch_components],
+                            metrics_for_batch.get("open_token_mse", 0.0) * open_count,
+                            open_count,
+                            metrics_for_batch.get("closed_token_mse", 0.0) * closed_count,
+                            closed_count,
+                            *[metrics_for_batch.get(key, 0.0) for key in self.contact_total_keys],
                         ])
-                        epoch_total += token_total
+                        regular_count = len(epoch_components)
+                        regular_totals = component_totals[:regular_count]
+                        open_total, open_count_total, closed_total, closed_count_total = component_totals[regular_count:regular_count + 4]
+                        contact_totals = component_totals[regular_count + 4:]
+                        epoch_contact_totals += contact_totals
+                        epoch_total += primary_total
                         epoch_samples += global_size
                         epoch_loss_total += loss_total
                         epoch_mask_total += mask_total
+                        for key, value in zip(epoch_components, regular_totals):
+                            epoch_components[key] += value
+                        epoch_open_token_sum += open_total
+                        epoch_open_token_count += open_count_total
+                        epoch_closed_token_sum += closed_total
+                        epoch_closed_token_count += closed_count_total
                         metrics = {"global_step": self.global_step, "epoch": epoch_number,
-                                   "train_mse": token_total / global_size, "train_loss": loss_total / global_size,
+                                   "objective": self.logging_objective,
+                                   "training_stage": self.training_stage,
+                                   "train_mse": primary_total / global_size, "train_loss": loss_total / global_size,
                                    "train_mask_mse": mask_total / global_size,
+                                   "train_per_rank_batch_size": size,
+                                   "train_global_batch_size": global_size,
                                    "grad_norm": grad_norm_value, "lr": self.optimizer.param_groups[0]["lr"],
                                    "batch_in_epoch": batch_index + 1, "batches_in_epoch": batches,
                                    "data_seconds": data_seconds, "step_seconds": step_seconds,
                                    "samples_per_second": global_size / max(data_seconds + step_seconds, 1e-6),
                                    "elapsed_seconds": time.monotonic() - self.started_at, **self._gpu_metrics()}
+                        metrics.update({f"train_{key}": value / global_size
+                                        for key, value in zip(epoch_components, regular_totals)})
+                        metrics.update({
+                            "train_open_token_mse": metrics_for_batch.get("open_token_mse", 0.0),
+                            "train_closed_token_mse": metrics_for_batch.get("closed_token_mse", 0.0),
+                        })
+                        metrics.update({f"train_{key}": value for key, value in
+                                        self._contact_means(contact_totals).items()})
                         logger.log(metrics)
-                        progress.set_postfix(mse=f"{metrics['train_mse']:.6f}",
-                                             mean=f"{epoch_total / epoch_samples:.6f}",
-                                             mask=f"{metrics['train_mask_mse']:.5f}", lr=f"{metrics['lr']:.2g}",
+                        progress.set_postfix(loss=f"{metrics['train_loss']:.4f}",
+                                             mse=f"{epoch_total / epoch_samples:.4f}",
+                                             field=f"{metrics['train_intensity_loss']:.4f}", lr=f"{metrics['lr']:.2g}",
                                              refresh=False)
-                        if (self.global_step == 1 or self.global_step % int(self.cfg.training.log_every) == 0
-                                or batch_index + 1 == batches):
-                            elapsed = time.monotonic() - epoch_started
-                            log.info(f"epoch={epoch_number}/{self.num_epochs} step={self.global_step} "
-                                  f"batch={batch_index + 1}/{batches} "
-                                  f"train_mse={metrics['train_mse']:.8f} "
-                                  f"epoch_mean_mse={epoch_total / epoch_samples:.8f} "
-                                  f"mask_mse={metrics['train_mask_mse']:.8f} loss={metrics['train_loss']:.8f} "
-                                  f"grad_norm={metrics['grad_norm']:.5f} "
-                                  f"lr={metrics['lr']:.3g} samples/s={metrics['samples_per_second']:.1f} "
-                                  f"data={data_seconds:.3f}s step_time={step_seconds:.3f}s "
-                                  f"elapsed={elapsed:.1f}s ETA={(batches - batch_index - 1) * elapsed / (batch_index + 1):.1f}s "
-                                  f"GPU_peak_MiB={metrics.get('gpu_peak_allocated_mib', 0):.0f}")
+                        now = time.monotonic()
+                        if (not self._progress_enabled() and self.is_main_process
+                                and now - last_status >= self._status_interval()):
+                            log.info("Train %d/%d | step=%d batch=%d/%d loss=%.5f mse=%.5f field=%.5f lr=%.2g",
+                                     epoch_number, self.num_epochs, self.global_step, batch_index + 1, batches,
+                                     metrics['train_loss'], epoch_total / epoch_samples,
+                                     metrics['train_intensity_loss'], metrics['lr'])
+                            last_status = now
                         previous_end = time.monotonic()
                         if self.max_steps is not None and self.global_step >= int(self.max_steps):
                             break
+                    progress.close()
                     self.epoch = epoch_number
+                    self.stage_epoch += 1
                     epoch_seconds = self._max_seconds(time.monotonic() - epoch_started)
+                    phase_rates = (self._phase_rates(self._sum(epoch_phase_totals.tolist()))
+                                   if self.phase_prediction_enabled else {})
                     logger.log({"global_step": self.global_step, "epoch": self.epoch,
+                                "objective": self.logging_objective,
+                                "training_stage": self.training_stage,
+                                **{f"epoch_train_{key}": value for key, value in phase_rates.items()},
+                                **{f"epoch_train_{key}": value for key, value in
+                                   self._contact_means(epoch_contact_totals).items()},
                                 "epoch_train_mse": epoch_total / epoch_samples,
                                 "epoch_train_loss": epoch_loss_total / epoch_samples,
                                 "epoch_train_mask_mse": epoch_mask_total / epoch_samples,
                                 "epoch_samples": epoch_samples, "epoch_seconds": epoch_seconds,
-                                "epoch_samples_per_second": epoch_samples / max(epoch_seconds, 1e-6)})
-                    log.info(f"Training epoch={self.epoch} complete: samples={epoch_samples}, "
-                             f"mean_mse={epoch_total / epoch_samples:.8f}, "
-                             f"mean_loss={epoch_loss_total / epoch_samples:.8f}, elapsed={epoch_seconds:.1f}s")
+                                "epoch_samples_per_second": epoch_samples / max(epoch_seconds, 1e-6),
+                                **{f"epoch_train_{key}": value / epoch_samples
+                                   for key, value in epoch_components.items()},
+                                "epoch_train_open_token_mse": (
+                                    epoch_open_token_sum / epoch_open_token_count
+                                    if epoch_open_token_count else 0.0
+                                ),
+                                "epoch_train_closed_token_mse": (
+                                    epoch_closed_token_sum / epoch_closed_token_count
+                                    if epoch_closed_token_count else 0.0
+                                ),
+                                "epoch_open_token_count": epoch_open_token_count,
+                                "epoch_closed_token_count": epoch_closed_token_count})
                     early_stop = self._validate_and_save(val_loader, logger)
+                    if early_stop and self.convergence_stages_enabled and self.training_stage in {"phase", "intensity"}:
+                        early_stop = False
+                        log.info("%s validation plateau: freeze best snapshot and advance next epoch", self.training_stage)
+                    if early_stop and self.training_stage == "adapter":
+                        self.adapter_epochs = self.stage_epoch
+                        early_stop = False
+                        log.info("Visual baseline validation plateau: freeze best adapter and continue next epoch")
+                    if early_stop and self.condition_prediction_enabled and self.training_stage == "intensity":
+                        # Condition convergence starts distillation rather than
+                        # terminating the whole two-stage experiment.
+                        self.intensity_epochs = self.stage_epoch if self.context_adapter_enabled else self.epoch
+                        early_stop = False
+                        log.info("Region/alpha validation plateau: start RGB distillation next epoch")
+                    if self.is_main_process:
+                        validation = (
+                            f" val={self.latest_val_loss:.6f} best={self.best_val_loss:.6f}"
+                            f" stale={self.epochs_without_improvement}/{self.patience}"
+                            f"{' [best saved]' if self.best_step == self.global_step else ''}"
+                            if val_loader is not None else "")
+                        log.info("Epoch %d/%d | step=%d loss=%.6f train=%.6f field=%.6f%s elapsed=%.1fs",
+                                 self.epoch, self.num_epochs, self.global_step,
+                                 epoch_loss_total / epoch_samples, epoch_total / epoch_samples,
+                                 epoch_components["intensity_loss"] / epoch_samples, validation,
+                                 time.monotonic() - epoch_started)
                     if self.max_steps is not None and self.global_step >= int(self.max_steps):
                         self.stop_reason = "max_steps"
                     elif early_stop:

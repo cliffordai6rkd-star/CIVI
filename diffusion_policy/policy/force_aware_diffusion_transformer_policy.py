@@ -15,26 +15,28 @@ from diffusion_policy.model.diffusion.context_transformer_for_diffusion import (
     ContextTransformerForDiffusion,
 )
 from diffusion_policy.model.vision.contact_curriculum import (
-    BlurSigmaScheduler,
-    ContactAwareImageMasker,
     ContactDetector,
+    ContactAwareImageMasker,
+    FactrBlurScheduler,
     HysteresisContactDetector,
     MaskProbabilityScheduler,
     VectorThresholdGate,
-    gaussian_blur_images,
+    gaussian_2d_smoothing,
+    select_contact_blur_mask,
 )
 from diffusion_policy.model.vision.force_aware_obs_encoder import ForceAwareObsEncoder
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 from diffusion_policy.model.vision.wrench_preprocessing import (
-    fill_future_wrench_prefix, preprocess_wrench,
+    fill_future_wrench_prefix, fusion_gate_from_phase, preprocess_wrench, validate_future_contact_mode,
+    validate_precontact_seconds,
 )
 
 
 def normalize_pose_quaternions(action: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    if action.shape[-1] != 7:
+    if action.shape[-1] not in (7, 8):
         return action
     normalized = normalize_quaternion_xyzw(action[..., 3:7], eps=eps)
-    return torch.cat([action[..., :3], normalized], dim=-1)
+    return torch.cat([action[..., :3], normalized, action[..., 7:]], dim=-1)
 
 
 class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
@@ -81,8 +83,7 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         input_gate_norm: str = "l1",
         input_gate_enabled: bool = False,
         camera_attention_mode: str = "joint",
-        image_mask_scope: str = "full_context",
-        mask_schedule: Optional[dict] = None,
+        image_blur_scope: str = "full_context",
         image_blur_schedule: Optional[dict] = None,
         obs_encoder: Optional[ForceAwareObsEncoder] = None,
         action_expert: Optional[nn.Module] = None,
@@ -90,9 +91,28 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         cross_attn_layers: int = 1,
         cross_attn_query: str = "wrench",
         cross_attn_query_residual: bool = True,
+        future_contact_mode: str = "legacy_rollout",
+        precontact_seconds: Optional[float] = None,
+        fusion_gate_mode: str = "attention_alpha",
+        action_representation: str = "ee_pose",
+        image_mask_scope: str = "full_context",
+        mask_schedule: Optional[dict] = None,
+        contact_fusion_gate: bool = False,
+        preserve_zero_wrench: bool = False,
         **scheduler_step_kwargs,
     ) -> None:
         super().__init__()
+        self.future_contact_mode = validate_future_contact_mode(future_contact_mode)
+        self.precontact_seconds = validate_precontact_seconds(precontact_seconds)
+        if fusion_gate_mode not in {"attention_alpha", "phase_binary"}:
+            raise ValueError("fusion_gate_mode must be 'attention_alpha' or 'phase_binary'")
+        self.fusion_gate_mode = str(fusion_gate_mode)
+        self.contact_fusion_gate = bool(contact_fusion_gate)
+        self.preserve_zero_wrench = bool(preserve_zero_wrench)
+        if self.contact_fusion_gate and future_phase_wrench_key is None:
+            raise ValueError("contact_fusion_gate requires future_phase_wrench_key")
+        if self.precontact_seconds is not None and future_phase_wrench_key is not None:
+            raise ValueError("Pre-contact gating requires causal wrench history")
         obs_shape_meta = shape_meta.get("obs", {})
         configured_image_keys = tuple(
             sorted(
@@ -186,6 +206,10 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             )
 
         action_dim = action_shape[0]
+        if action_representation not in {"ee_pose", "joint_position"}:
+            raise ValueError("action_representation must be 'ee_pose' or 'joint_position'")
+        if relative_pose_actions and action_representation != "ee_pose":
+            raise ValueError("relative_pose_actions requires action_representation='ee_pose'")
         if relative_pose_actions and action_dim != 7:
             raise ValueError(
                 "relative_pose_actions requires action shape [7] in xyz + xyzw format"
@@ -212,8 +236,14 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
                 cross_attn_query=cross_attn_query,
                 cross_attn_query_residual=cross_attn_query_residual,
                 image_shapes={key: obs_shape_meta[key]["shape"] for key in configured_image_keys},
+                image_token_masking=mask_schedule is not None,
             )
         encoder_image_keys = tuple(getattr(obs_encoder, "image_keys", ()))
+        if (self.fusion_gate_mode == "phase_binary" or self.contact_fusion_gate) and (
+            getattr(obs_encoder, "cross_attn_query", None) != "image"
+            or getattr(obs_encoder, "cross_attn_layers", 0) <= 0
+        ):
+            raise ValueError("Full fusion gating requires image-query cross-attention")
         if encoder_image_keys and encoder_image_keys != configured_image_keys:
             raise ValueError(
                 f"obs_encoder cameras={list(encoder_image_keys)} do not match "
@@ -263,13 +293,17 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             norm=input_gate_norm,
             enabled=input_gate_enabled,
         )
-        self.image_masker = ContactAwareImageMasker(scope=image_mask_scope)
-        self.mask_scheduler = MaskProbabilityScheduler(**(mask_schedule or {}))
-        # Missing blur settings preserve the curriculum of existing checkpoints.
         self.blur_scheduler = (
-            BlurSigmaScheduler(**image_blur_schedule)
+            FactrBlurScheduler(**image_blur_schedule)
             if image_blur_schedule is not None else None
         )
+        self.mask_scheduler = MaskProbabilityScheduler(**mask_schedule) if mask_schedule is not None else None
+        self.image_masker = ContactAwareImageMasker(scope=image_mask_scope) if self.mask_scheduler is not None else None
+        if image_blur_scope not in {"current_observation", "full_context", "precontact_contact"}:
+            raise ValueError(
+                "image_blur_scope must be 'current_observation', 'full_context', or 'precontact_contact'"
+            )
+        self.image_blur_scope = str(image_blur_scope)
         self.normalizer = LinearNormalizer()
 
         self.horizon = int(horizon)
@@ -277,6 +311,7 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         self.n_obs_steps = int(n_obs_steps)
         self.action_start_index = int(action_start_index)
         self.action_dim = int(action_dim)
+        self.action_representation = action_representation
         self.image_keys = configured_image_keys
         self.image_key = configured_image_keys[0] if len(configured_image_keys) == 1 else None
         self.wrench_key = wrench_key
@@ -291,6 +326,8 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         self.optimizer_step = 0
         self.last_curriculum_metrics: Dict[str, float] = {}
         self.freeze_modules = tuple(str(name) for name in (freeze_modules or ()))
+        self._latest_processed_wrench = None
+        self._latest_normalized_wrench = None
         self.set_freeze_modules(self.freeze_modules)
         self.num_inference_steps = (
             int(num_inference_steps)
@@ -399,6 +436,11 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         if self.obs_encoder.freeze_backbone:
             self.obs_encoder._set_backbone_frozen()
 
+    def reset(self):
+        super().reset()
+        self._latest_processed_wrench = None
+        self._latest_normalized_wrench = None
+
     def _validate_obs(
         self, obs_dict: Dict[str, torch.Tensor]
     ) -> Tuple[
@@ -435,16 +477,35 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             raise ValueError(f"policy requires {self.n_obs_steps} observation steps")
         return images, raw_phase_wrench, raw_wrench, raw_future_phase_wrench
 
-    def prepare_context_inputs(self, obs_dict):
+    def _prepare_context_inputs(self, obs_dict, *, return_future_contact=False):
         """Prepare RGB and wrench exactly as the teacher does, before learned encoders."""
         images, phase_wrench, wrench, future_phase_wrench = self._validate_obs(obs_dict)
-        normalized_wrench, contact, future_has_contact = preprocess_wrench(
+        normalized_wrench, contact, future_contact_or_has, processed_wrench = preprocess_wrench(
             wrench, phase_wrench, future_phase_wrench,
             shared_phase_signal=self.phase_wrench_key == self.wrench_key,
             contact_detector=self.contact_detector, input_gate=self.input_gate,
             normalizer=self.normalizer, wrench_key=self.wrench_key,
+            future_contact_mode=getattr(self, "future_contact_mode", "legacy_rollout"),
+            return_processed_wrench=True,
+            return_future_contact=return_future_contact,
+            precontact_seconds=getattr(self, "precontact_seconds", None),
+            preserve_zero_wrench=getattr(self, "preserve_zero_wrench", False),
         )
-        return images, normalized_wrench, contact, future_has_contact
+        self._latest_processed_wrench = processed_wrench.detach()
+        self._latest_normalized_wrench = normalized_wrench.detach()
+        return images, normalized_wrench, contact, future_contact_or_has
+
+    def prepare_context_inputs(self, obs_dict):
+        """Prepare inputs while retaining the legacy reduced contact return."""
+        return ForceAwareDiffusionTransformerPolicy._prepare_context_inputs(
+            self, obs_dict, return_future_contact=False,
+        )
+
+    def prepare_context_inputs_with_future_contact(self, obs_dict):
+        """Prepare inputs and return the complete ``[B, To, K]`` contact mask."""
+        return ForceAwareDiffusionTransformerPolicy._prepare_context_inputs(
+            self, obs_dict, return_future_contact=True,
+        )
 
     def _encode_context(
         self,
@@ -452,40 +513,45 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         apply_curriculum_mask: bool,
         generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
-        images, normalized_wrench, contact, future_has_contact = self.prepare_context_inputs(obs_dict)
-        # The curriculum degrades image evidence only for windows
-        # whose *future* reaches contact.  The current observation is often
-        # still free in these windows, and its tau_ext history is therefore
-        # zero; using ``contact`` here would mask the wrong phase (or miss the
-        # future-contact window entirely).  Keep the legacy current-contact
-        # behavior only for configurations that do not provide a future phase
-        # window.
-        mask_contact = future_has_contact if future_has_contact is not None else contact
+        images, normalized_wrench, contact, future_contact = (
+            self.prepare_context_inputs_with_future_contact(obs_dict)
+        )
+        future_has_contact = future_contact.any(dim=-1)
+        # The curriculum degrades image evidence only for windows whose
+        # *future* reaches contact.  The current observation is often still
+        # free in these windows, so using ``contact`` would blur the wrong
+        # phase (or miss the future-contact window entirely).  Configurations
+        # without a future phase signal use their current contact state.
+        blur_contact = future_has_contact
         sigma = 0.0
-        if self.blur_scheduler is not None:
-            probability = 0.0
+        blurred_images = torch.zeros_like(blur_contact, dtype=torch.bool)
+        if self.blur_scheduler is not None and apply_curriculum_mask:
             sigma = self.blur_scheduler.sigma(self.optimizer_step)
-            blurred_images = self.image_masker(
-                mask_contact, probability=1.0,
-                enabled=apply_curriculum_mask and sigma > 0,
-            )
+            if sigma > 0:
+                if self.image_blur_scope == "precontact_contact":
+                    # Use offline per-frame phase labels, not alpha: the first
+                    # pre-contact frame has alpha=0 but must still be blurred.
+                    phase = obs_dict.get("contact_phase")
+                    if (phase is None or phase.ndim != 2
+                            or phase.shape[0] != contact.shape[0]
+                            or phase.shape[1] < self.n_obs_steps):
+                        raise ValueError(
+                            "precontact_contact blur requires obs['contact_phase'] "
+                            "with shape [B, T >= n_obs_steps] (0=free, 1=precontact, 2=contact)"
+                        )
+                    phase = phase[:, :self.n_obs_steps]
+                    blurred_images = (phase == 1) | (phase == 2)
+                else:
+                    blurred_images = select_contact_blur_mask(
+                        blur_contact, scope=self.image_blur_scope
+                    )
             if blurred_images.any():
                 images = {key: value.clone() for key, value in images.items()}
-                for value in images.values():
-                    value[blurred_images] = gaussian_blur_images(value[blurred_images], sigma)
-            # Blurred RGB must reach DINO; do not replace its encoded tokens.
-            image_mask = torch.zeros_like(mask_contact, dtype=torch.bool)
-        else:
-            probability = self.mask_scheduler.probability(self.optimizer_step)
-            image_mask = self.image_masker(
-                mask_contact,
-                probability=probability,
-                enabled=apply_curriculum_mask,
-                generator=generator,
-            )
-            blurred_images = torch.zeros_like(image_mask)
+                for key, value in images.items():
+                    images[key][blurred_images] = gaussian_2d_smoothing(
+                        value[blurred_images], sigma
+                    )
         self.last_curriculum_metrics = {
-            "curriculum/mask_probability": probability,
             "curriculum/contact_fraction": contact.float().mean().item(),
             "curriculum/current_contact_fraction": contact.float().mean().item(),
             "curriculum/future_contact_fraction": (
@@ -493,15 +559,42 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
                 if future_has_contact is not None
                 else contact.float().mean().item()
             ),
-            "curriculum/masked_image_fraction": image_mask.float().mean().item(),
             "curriculum/blur_sigma": sigma,
             "curriculum/blurred_image_fraction": blurred_images.float().mean().item(),
             "curriculum/optimizer_step": float(self.optimizer_step),
         }
+        fusion_kwargs = {}
+        if self.mask_scheduler is not None:
+            probability = (self.mask_scheduler.probability(self.optimizer_step)
+                           if apply_curriculum_mask else 0.0)
+            mask_contact = (fusion_gate_from_phase(obs_dict, self.n_obs_steps)
+                            if self.image_masker.scope == "precontact_contact" else future_has_contact)
+            image_mask = self.image_masker(
+                mask_contact, probability=probability,
+                enabled=apply_curriculum_mask, generator=generator,
+            )
+            if self.contact_fusion_gate:
+                image_mask = image_mask & future_has_contact
+            fusion_kwargs["image_token_mask"] = image_mask
+            self.last_curriculum_metrics.update({
+                "curriculum/mask_probability": probability,
+                "curriculum/masked_image_fraction": image_mask.float().mean().item(),
+            })
+        if self.contact_fusion_gate:
+            fusion_kwargs["fusion_gate"] = future_has_contact
+        elif self.fusion_gate_mode == "phase_binary":
+            fusion_kwargs["fusion_gate"] = fusion_gate_from_phase(obs_dict, self.n_obs_steps)
+        elif (
+            getattr(self.obs_encoder, "cross_attn_query", None) == "image"
+            and getattr(self.obs_encoder, "cross_attn_layers", 0) > 0
+        ):
+            fusion_kwargs["future_contact"] = future_contact
+            if "contact_alpha" in obs_dict:
+                fusion_kwargs["contact_alpha"] = obs_dict["contact_alpha"][:, :self.n_obs_steps]
         return self.obs_encoder(
             images=images,
             wrench_history=normalized_wrench,
-            image_token_mask=image_mask,
+            **fusion_kwargs,
         )
 
     def conditional_sample(
@@ -534,7 +627,7 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
     def predict_action(
         self,
         obs_dict: Dict[str, torch.Tensor],
-        generator: Optional[torch.Generator] = None,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
     ) -> Dict[str, torch.Tensor]:
         if "past_action" in obs_dict:
             raise NotImplementedError("past_action conditioning is not implemented")
@@ -548,7 +641,8 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         model_action_prediction = self.normalizer["action"].unnormalize(
             normalized_prediction
         )
-        model_action_prediction = normalize_pose_quaternions(model_action_prediction)
+        if self.action_representation == "ee_pose":
+            model_action_prediction = normalize_pose_quaternions(model_action_prediction)
         action_prediction = model_action_prediction
         if self.relative_pose_actions:
             if self.action_reference_key not in obs_dict:

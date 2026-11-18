@@ -1,51 +1,23 @@
-"""
-Usage:
-Training:
-python train.py --config-name=train_diffusion_lowdim_workspace
-python train.py -c diffusion_policy/config/train_zarr/train_hirol_fr3_unet_abs_jp.yaml
+"""Train the CIVI teacher/student pipeline, or one explicit Hydra workspace.
 
-GPU Selection:
-# Single GPU training - specify device
-python train.py --config-name=train_hirol_fr3_unet_abs_jp_ee_state.yaml training.device=cuda:0
-python train.py --config-name=train_hirol_fr3_unet_abs_jp_ee_state.yaml training.device=cuda:1
-
-# Multi-GPU data-parallel training (torchrun creates one process per GPU)
-CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 train.py \
-    --config-name=train_dp_inert_usb
-
-# CPU training (for debugging)
-python train.py --config-name=train_hirol_fr3_unet_abs_jp_ee_state.yaml training.device=cpu
-
-Examples:
-# Train on specific GPU with custom output directory
-python train.py --config-dir=. --config-name=train_hirol_fr3_unet_abs_jp_ee_state.yaml \
-    training.device=cuda:1 \
-    hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}_gpu1'
-
-# Multi-GPU server deployment
-CUDA_VISIBLE_DEVICES=2,3 torchrun --standalone --nproc_per_node=2 train.py \
-    --config-dir=diffusion_policy/config --config-name=train_force_aware_diffusion_workspace \
-    hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}_multi_gpu'
-
-Notes:
-- Use CUDA_VISIBLE_DEVICES to control which GPUs are visible to PyTorch
-- training.device=cuda:0 refers to the first visible GPU (after CUDA_VISIBLE_DEVICES filtering)
-- For multi-GPU training, use torchrun; each rank maps to its LOCAL_RANK device
-- Check GPU availability with: nvidia-smi
+python train.py
+python train.py --config diffusion_policy/config/train_civi_teacher.yaml
 """
 
 import sys
-import inspect
 
-# Keep CLI logs line-buffered without replacing the underlying file
-# descriptors.  Reopening fd 1/2 at import time breaks pytest capture (and
-# callers embedding the training module) because the capture-owned descriptors
-# are closed while the new streams remain installed globally.
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(line_buffering=True)
-    except (AttributeError, OSError, ValueError):
-        pass
+# The no-argument command runs the current teacher/student pipeline. Explicit
+# Hydra arguments below continue to select a single configured workspace.
+if __name__ == "__main__" and len(sys.argv) == 1:
+    from train_pipeline import main as pipeline_main
+
+    pipeline_main()
+    raise SystemExit(0)
+
+import inspect
+# use line-buffering for both stdout and stderr
+sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
+sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1)   
 
 import hydra
 import torch
@@ -56,7 +28,8 @@ import pathlib
 import os
 import tempfile
 from hydra.core.hydra_config import HydraConfig
-from diffusion_policy.common.config_cli import rewrite_config_reference_argv
+from diffusion_policy.common.config_cli import parse_overwrite_argv, rewrite_config_reference_argv
+from diffusion_policy.common.training_output import reset_training_output
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 from diffusion_policy.workspace.train_force_aware_diffusion_workspace import (
     initialize_distributed,
@@ -71,6 +44,7 @@ REPO_ROOT = pathlib.Path(__file__).parent.resolve()
 BCPOLICY_PACKAGE_ROOT = REPO_ROOT.joinpath("BCpolicy")
 DEFAULT_CONFIG_DIR = REPO_ROOT.joinpath("diffusion_policy", "config")
 _TEMP_CONFIG_DIR = None
+_OVERWRITE_REQUESTED = False
 
 if BCPOLICY_PACKAGE_ROOT.is_dir():
     bcpolicy_path = str(BCPOLICY_PACKAGE_ROOT)
@@ -268,6 +242,28 @@ def main(cfg: OmegaConf):
                 f"{cls.__name__} does not implement the repository DDP protocol. "
                 "Use a DDP-enabled workspace or launch this config with one process."
             )
+        if _OVERWRITE_REQUESTED:
+            reset_error = None
+            if distributed.is_main:
+                try:
+                    reset_training_output(
+                        output_dir,
+                        hydra_output_subdir=HydraConfig.get().output_subdir,
+                        protected_paths=(REPO_ROOT,),
+                    )
+                    print(f"[overwrite] Reset output directory; starting fresh: {output_dir}", flush=True)
+                except Exception as exc:
+                    reset_error = str(exc)
+            if distributed.enabled:
+                # Only rank 0 removes files. All ranks wait for its result
+                # before any workspace can create checkpoints or metrics.
+                result = [reset_error]
+                dist.broadcast_object_list(
+                    result, src=0, device=torch.device("cuda", distributed.local_rank),
+                )
+                reset_error = result[0]
+            if reset_error is not None:
+                raise RuntimeError(f"Could not overwrite training output: {reset_error}")
         workspace_kwargs = {"output_dir": output_dir}
         if "distributed" in init_params:
             workspace_kwargs["distributed"] = distributed
@@ -279,6 +275,7 @@ def main(cfg: OmegaConf):
 
 if __name__ == "__main__":
     default_config_dir = DEFAULT_CONFIG_DIR
+    sys.argv, _OVERWRITE_REQUESTED = parse_overwrite_argv(sys.argv)
     sys.argv = rewrite_config_reference_argv(
         sys.argv,
         default_config_dir=str(default_config_dir),

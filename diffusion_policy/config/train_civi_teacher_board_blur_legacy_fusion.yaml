@@ -1,0 +1,5 @@
+# Compatibility name: the unified mask-token teacher; no blur recipe remains here.
+defaults:
+  - train_civi_teacher
+  - _self_
+name: train_civi_teacher_board_blur_legacy_fusion

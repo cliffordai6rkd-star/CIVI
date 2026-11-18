@@ -30,18 +30,19 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf, open_dict
 
+from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.model.vision.render_net import build_render_net
-from diffusion_policy.model.vision.wrench_preprocessing import WrenchPreprocessor
+from diffusion_policy.model.vision.wrench_preprocessing import WrenchPreprocessor, fusion_gate_from_phase
 from diffusion_policy.scripts import visualize_cross_attention_episode as common
 from diffusion_policy.scripts import visualize_image_query_cross_attention_episode as rendering
 from diffusion_policy.workspace.train_force_aware_diffusion_workspace import resolve_amp_dtype
 
 
-def parse_args(argv=None):
+def parse_args(argv=None, *, checkpoint_required=True, episode_required=True):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", type=pathlib.Path, required=True,
+    parser.add_argument("--checkpoint", type=pathlib.Path, required=checkpoint_required,
                         help="RenderNet distillation checkpoint, e.g. checkpoints/best.ckpt.")
-    parser.add_argument("--episode", type=int, required=True)
+    parser.add_argument("--episode", type=int, required=episode_required)
     parser.add_argument("--camera", choices=("wrist", "side", "both"), default="both")
     parser.add_argument("--dataset-path", type=pathlib.Path)
     parser.add_argument("--video-backend", choices=("pyav", "torchcodec"), default="pyav")
@@ -50,11 +51,13 @@ def parse_args(argv=None):
     parser.add_argument("--max-frames", type=int)
     parser.add_argument("--fps", type=float, help="Default: dataset FPS divided by stride.")
     parser.add_argument("--video-codec", choices=("h264", "av1", "mpeg4"), default="h264")
-    parser.add_argument("--difference-gain", type=float, default=5.0,
-                        help="Magnification for the signed RGB difference panel only (default: 5).")
+    parser.add_argument("--difference-gain", type=float, default=1.0,
+                        help="Magnification for the signed RGB difference panel only (default: 1).")
     parser.add_argument("--save-frames", action="store_true", help="Also save PNGs for every video frame.")
     parser.add_argument("--disable-high-attention-render", action="store_true",
                         help="Bypass a trained region head and apply the residual across the full image.")
+    parser.add_argument("--threshold", type=float,
+                        help="Override the soft-mask threshold: retain M only where M > threshold.")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
     if args.episode < 0 or args.stride < 1 or (args.max_frames is not None and args.max_frames < 1):
@@ -63,12 +66,18 @@ def parse_args(argv=None):
         parser.error("--fps must be positive and finite")
     if not math.isfinite(args.difference_gain) or args.difference_gain <= 0:
         parser.error("--difference-gain must be positive and finite")
+    if args.threshold is not None and (not math.isfinite(args.threshold) or not 0 <= args.threshold <= 1):
+        parser.error("--threshold must be finite and between 0 and 1")
     return args
 
 
 def output_paths(checkpoint, args):
     directory = checkpoint.parent.parent / "attention_visualize"
     stem = f"render_net_episode_{args.episode}_{args.camera}"
+    if args.disable_high_attention_render:
+        stem += "_no_region_gate"
+    if args.threshold is not None:
+        stem += f"_threshold_{args.threshold:g}"
     return {
         "comparison": directory / f"{stem}_comparison.mp4",
         "rendered": directory / f"{stem}_rendered.mp4",
@@ -98,21 +107,57 @@ def load_render_net(checkpoint, device=None):
     wrench_key = str(teacher_cfg.policy.wrench_key)
     wrench_dim = int(teacher_cfg.policy.shape_meta.obs[wrench_key].shape[-1])
     model = build_render_net(wrench_dim, OmegaConf.to_container(cfg.render_net, resolve=True))
-    model.load_state_dict(payload["state_dicts"]["model"], strict=True)
+    state_key = "ema_model" if "ema_model" in payload["state_dicts"] else "model"
+    model.load_state_dict(payload["state_dicts"][state_key], strict=True)
     model.to(device).eval().requires_grad_(False)
     preprocessor = WrenchPreprocessor.from_config(cfg.wrench_preprocessing)
     preprocessor.load_state_dict(payload["state_dicts"]["wrench_preprocessor"], strict=True)
     preprocessor.to(device).eval().requires_grad_(False)
     pickles = payload.get("pickles", {})
     info = {key: dill.loads(pickles[key]) for key in ("global_step", "best_val_loss") if key in pickles}
+    info["student_state_key"] = state_key
     return model, preprocessor, cfg, teacher_cfg, device, info
 
 
 def render_observations(model, preprocessor, obs, image_keys, n_obs_steps, *, use_attention_mask=None):
     """Use the same physical gating and normalization as teacher and student training."""
     images = {key: obs[key][:, :n_obs_steps] for key in image_keys}
-    wrench, _, _ = preprocessor(obs)
-    return images, model(images, wrench, use_attention_mask=use_attention_mask)
+    predict_phase = bool(getattr(model, "phase_prediction_enabled", False)
+                         or getattr(model, "condition_prediction_enabled", False))
+    # Dataset phase/alpha targets use future contact onset.  Deployment must
+    # infer its gate from the causal RGB and measured wrench observations.
+    preprocessing_obs = ({key: value for key, value in obs.items()
+                          if key not in {"contact_alpha", "contact_phase"}}
+                         if predict_phase else obs)
+    wrench, contact, future_contact = preprocessor(preprocessing_obs, return_future_contact=True)
+    contact_gate = future_contact if future_contact is not None else contact
+    causal_phase = getattr(model, "phase_predictor", None) is not None
+    if causal_phase:
+        contact_gate = render_alpha = None
+    elif getattr(preprocessor, "fusion_gate_mode", "attention_alpha") == "phase_binary":
+        contact_gate = fusion_gate_from_phase(obs, n_obs_steps)
+        render_alpha = contact_gate.float()
+    else:
+        render_alpha = (obs["contact_alpha"][:, :n_obs_steps]
+                        if not predict_phase and "contact_alpha" in obs else None)
+    return images, model(
+        images, wrench, future_contact=contact_gate,
+        contact_alpha=render_alpha,
+        use_attention_mask=use_attention_mask,
+        **({"phase_inputs": obs.get("phase_inputs")} if causal_phase else {}),
+    )
+
+
+def encode_student_context(model, preprocessor, obs, obs_encoder, n_obs_steps, *, input_grad=False):
+    """Deployment context, including the checkpoint's always-on visual adapter.
+
+    Use this context with the frozen DiT. Rendering RGB alone is insufficient
+    for adapter-enabled checkpoints. Offline alpha labels are never required.
+    """
+    _, rendered = render_observations(model, preprocessor, obs, obs_encoder.image_keys, n_obs_steps)
+    adapter = getattr(model, "context_adapter", None)
+    kwargs = {"context_adapter": adapter} if adapter is not None else {}
+    return obs_encoder.encode_image_context(rendered, input_grad=input_grad, **kwargs)
 
 
 def _to_rgb(values):
@@ -179,7 +224,15 @@ def _save_rgb(path, frame):
 def run(args):
     checkpoint = common.choose_checkpoint(args.checkpoint, None)
     model, preprocessor, cfg, teacher_cfg, device, checkpoint_info = load_render_net(checkpoint, args.device)
-    attention_enabled = model.high_attention_enabled and not args.disable_high_attention_render
+    if args.threshold is not None:
+        if (not hasattr(model, "region_threshold") or not model.high_attention_enabled
+                or model.region_selection != "soft" or args.disable_high_attention_render):
+            raise ValueError("--threshold requires a RenderNet v2 checkpoint with a soft region mask")
+        model.region_threshold = args.threshold
+        with open_dict(cfg):
+            cfg.render_net.high_attention_render.threshold = args.threshold
+    attention_enabled = (model.high_attention_enabled and getattr(model, "use_region_gate", True)
+                         and not args.disable_high_attention_render)
     image_keys = sorted(key for key, spec in teacher_cfg.policy.shape_meta.obs.items() if spec.get("type") == "rgb")
     camera_keys = [key for key in ("wrist", "side") if key in image_keys]
     camera_keys.extend(key for key in image_keys if key not in camera_keys)
@@ -198,7 +251,8 @@ def run(args):
     writers = {}
     amp_enabled = device.type == "cuda" and bool(cfg.training.amp.enabled)
     amp_dtype = resolve_amp_dtype(cfg.training.amp.dtype)
-    print(f"RenderNet: {checkpoint}; step={checkpoint_info.get('global_step')}\n"
+    print(f"RenderNet: {checkpoint}; step={checkpoint_info.get('global_step')}; "
+          f"weights={checkpoint_info['student_state_key']}\n"
           f"Device: {device}; cameras={image_keys}; displayed={camera_keys}; wrench={wrench_key}", flush=True)
     try:
         selected = common.episode_sample_indices(dataset, args.episode)[::args.stride]
@@ -210,8 +264,10 @@ def run(args):
         stats = {key: {"mae": [], "max_abs_delta": []} for key in camera_keys}
         for index, (anchor, sample_index) in enumerate(selected):
             sample = dataset[sample_index]
-            obs = {key: value.unsqueeze(0).to(device) for key, value in sample["obs"].items()
-                   if key in image_keys or key in preprocessor.required_keys}
+            obs = dict_apply({key: value for key, value in sample["obs"].items()
+                              if key in image_keys or key in preprocessor.required_keys
+                              or key in {"phase_inputs", "contact_phase", "contact_alpha"}},
+                             lambda value: value.unsqueeze(0).to(device))
             autocast = torch.autocast("cuda", dtype=amp_dtype) if amp_enabled else contextlib.nullcontext()
             with torch.inference_mode(), autocast:
                 images, rendered = render_observations(model, preprocessor, obs, image_keys, steps,
@@ -221,7 +277,8 @@ def run(args):
                 stats[key]["mae"].append(float(delta.mean()))
                 stats[key]["max_abs_delta"].append(float(delta.max()))
             seconds = (anchor - selected[0][0]) / dataset_fps
-            title = f"RenderNet RGB | ep {args.episode} | {index + 1}/{len(selected)} | {seconds:.2f}s | step {checkpoint_info.get('global_step', '?')}"
+            label = "RGB (region gate off)" if not attention_enabled else "RenderNet RGB"
+            title = f"{label} | ep {args.episode} | {index + 1}/{len(selected)} | {seconds:.2f}s | step {checkpoint_info.get('global_step', '?')}"
             frames = video_frames(images, rendered, camera_keys, title=title, difference_gain=args.difference_gain)
             for key, frame in frames.items():
                 if key not in writers:
@@ -253,11 +310,25 @@ def run(args):
             "wrench_preprocessing": OmegaConf.to_container(cfg.wrench_preprocessing, resolve=True),
             "wrench_preprocessing_observation_keys": list(preprocessor.required_keys),
             "residual_scale": model.residual_scale, "difference_gain": args.difference_gain,
-            "backbone": model.backbone_name, "high_attention_render_enabled": attention_enabled,
+            "image_encoder": model.image_encoder_name,
+            "wrench_encoder": model.wrench_encoder_name,
+            "image_self_attn_layers": len(model.backbone.image_self_attention),
+            "cross_attn_layers": len(model.backbone.cross_attention),
+            "decoder_layers": model.backbone.decoder_layers,
+            "high_attention_render_enabled": attention_enabled,
+            "use_region_gate": getattr(model, "use_region_gate", True),
+            "use_contact_alpha": getattr(model, "use_contact_alpha", True),
             "region_source": "student-predicted teacher region" if attention_enabled else "full image",
             "high_attention_render_config": OmegaConf.to_container(cfg.render_net.high_attention_render, resolve=True)
             if "high_attention_render" in cfg.render_net else None,
-            "rendered_rgb": "clamp(original + residual_scale * region_weight * tanh(RenderNet RGB residual), 0, 1); region_weight=1 when disabled; no display amplification",
+            "rendering_mode": getattr(model, "rendering_mode", "residual"),
+            "rendered_rgb": (
+                "original + " + ("contact_alpha * " if getattr(model, "use_contact_alpha", True) else "")
+                + "(1 - original) * (1 - exp(-residual_scale * region_weight * Gaussian glow)); no display amplification"
+                if getattr(model, "rendering_mode", "residual") == "gaussian_glow" else
+                "clamp(original + " + ("contact_alpha * " if getattr(model, "use_contact_alpha", True) else "")
+                + "residual_scale * region_weight * tanh(RenderNet RGB residual), 0, 1); region_weight=1 when disabled; no display amplification"
+            ),
             "difference_rgb": "clip(0.5 + difference_gain * (rendered - original), 0, 1); signed RGB delta centered at gray, not attention",
             "stats_scope": "displayed cameras and latest observation; RGB units in [0,1], before video encoding",
             "camera_stats": {key: {"mean_abs_rgb_delta": float(np.mean(stats[key]["mae"])),

@@ -17,13 +17,12 @@ from diffusion_policy.model.diffusion.context_transformer_for_diffusion import (
     ContextTransformerForDiffusion,
 )
 from diffusion_policy.model.vision.contact_curriculum import (
-    BlurSigmaScheduler,
-    ContactAwareImageMasker,
+    FactrBlurScheduler,
     ContactDetector,
     HysteresisContactDetector,
-    MaskProbabilityScheduler,
     VectorThresholdGate,
-    gaussian_blur_images,
+    gaussian_2d_smoothing,
+    select_contact_blur_mask,
 )
 from diffusion_policy.model.vision.force_aware_obs_encoder import ForceAwareObsEncoder
 from diffusion_policy.model.vision.render_net import RenderNet
@@ -91,7 +90,7 @@ def make_obs_encoder(
     )
 
 
-def make_normalizer(wrench_keys=("wrench_ext",)):
+def make_normalizer(wrench_keys=("wrench_ext",), action_dim=7):
     normalizer = LinearNormalizer()
     for wrench_key in wrench_keys:
         normalizer[wrench_key] = SingleFieldLinearNormalizer.create_fit(
@@ -99,26 +98,28 @@ def make_normalizer(wrench_keys=("wrench_ext",)):
             last_n_dims=1,
         )
     normalizer["action"] = SingleFieldLinearNormalizer.create_fit(
-        torch.linspace(-2.0, 2.0, 700).reshape(100, 7),
+        torch.linspace(-2.0, 2.0, 100 * action_dim).reshape(100, action_dim),
         last_n_dims=1,
     )
     return normalizer
 
 
 def make_policy(
-    mask_scope="full_context",
+    blur_scope="full_context",
     relative_pose_actions=False,
     image_keys=("wrist",),
     future_phase=False,
     pre_cross_self_attn_layers=0,
     image_blur_schedule=None,
+    action_dim=7,
+    action_representation="ee_pose",
 ):
     encoder = make_obs_encoder(
         image_keys=image_keys, pre_cross_self_attn_layers=pre_cross_self_attn_layers
     )
     expert = ContextTransformerForDiffusion(
-        input_dim=7,
-        output_dim=7,
+        input_dim=action_dim,
+        output_dim=action_dim,
         horizon=9,
         n_emb=16,
         n_head=4,
@@ -161,31 +162,25 @@ def make_policy(
     policy = ForceAwareDiffusionTransformerPolicy(
         shape_meta={
             "obs": obs_meta,
-            "action": {"shape": [7]},
+            "action": {"shape": [action_dim]},
         },
         noise_scheduler=scheduler,
         horizon=9,
         n_action_steps=8,
         n_obs_steps=2,
         relative_pose_actions=relative_pose_actions,
+        action_representation=action_representation,
         num_inference_steps=2,
         n_emb=16,
         contact_threshold=policy_contact_threshold,
-        image_mask_scope=mask_scope,
+        image_blur_scope=blur_scope,
         image_blur_schedule=image_blur_schedule,
-        mask_schedule={
-            "schedule_type": "cosine",
-            "start_step": 0,
-            "end_step": 100,
-            "start_probability": 1.0,
-            "end_probability": 0.0,
-        },
         obs_encoder=encoder,
         action_expert=expert,
         **policy_kwargs,
     )
     policy.set_normalizer(
-        make_normalizer(("wrench_ext", "future_wrench") if future_phase else ("wrench_ext",))
+        make_normalizer(("wrench_ext", "future_wrench") if future_phase else ("wrench_ext",), action_dim)
     )
     return policy
 
@@ -234,7 +229,7 @@ def test_hysteresis_contact_detector_supports_l1_norm_and_future_rollout():
     assert rollout.tolist() == [[[False, False, True, True]]]
 
 
-def test_hysteresis_contact_detector_requires_five_consecutive_frames():
+def test_hysteresis_contact_detector_requires_five_consecutive_frames_for_causal_scan():
     detector = HysteresisContactDetector(
         free_threshold=8.0,
         contact_threshold=8.0,
@@ -247,9 +242,35 @@ def test_hysteresis_contact_detector_requires_five_consecutive_frames():
         [[[[9.0], [9.0], [9.0], [9.0], [9.0],
            [7.0], [7.0], [7.0], [7.0], [7.0]]]]
     )
-    states = detector.rollout_future(wrench, initial_state=torch.tensor([[False]]))
-    assert states.tolist() == [[[False, False, False, False, True,
-                                 True, True, True, True, False]]]
+    # The causal scan keeps the configured debounce.  Future windows use a
+    # horizon-aware suffix rule tested below instead.
+    states = detector._scan_tokens(wrench.reshape(1, -1), initial_state=torch.tensor([False]))
+    assert states.tolist() == [[False, False, False, False, True,
+                                True, True, True, True, False]]
+
+
+def test_future_rollout_accepts_late_three_frame_contact_without_chatter():
+    detector = HysteresisContactDetector(
+        free_threshold=8.0,
+        contact_threshold=8.0,
+        force_dims=(0,),
+        norm="l2",
+        enter_frames=5,
+        exit_frames=5,
+    )
+    # Contact begins at the sixth of eight future samples.  Only the final
+    # three samples remain, so a fixed five-frame debounce would erase it.
+    future = torch.zeros(1, 1, 8, 1)
+    future[..., 5:, 0] = 9.0
+    states = detector.rollout_future(future, initial_state=torch.tensor([[False]]))
+    assert states.tolist() == [[[False, False, False, False, False, True, True, True]]]
+
+    # A short early spike still does not enter contact, preserving debounce
+    # against noise and repeated state switching.
+    noisy = torch.zeros(1, 1, 8, 1)
+    noisy[..., 1, 0] = 9.0
+    noisy_states = detector.rollout_future(noisy, initial_state=torch.tensor([[False]]))
+    assert noisy_states.count_nonzero() == 0
 
 
 def test_future_wrench_prefix_uses_first_contact_vector():
@@ -362,78 +383,63 @@ def test_policy_freeze_selectors_exclude_cross_attention_from_optimizer():
     assert policy.get_freeze_config()["freeze_modules"] == ("cross_attn",)
 
 
-@pytest.mark.parametrize("schedule_type", ["linear", "cosine", "exponential"])
-def test_mask_scheduler_has_exact_endpoints(schedule_type):
-    scheduler = MaskProbabilityScheduler(
-        schedule_type=schedule_type,
-        start_step=10,
-        end_step=110,
-        start_probability=0.9,
-        end_probability=0.1,
+def test_factr_blur_scheduler_preserves_explicit_phase_boundaries():
+    scheduler = FactrBlurScheduler(
+        total_steps=200_000, start_fraction=0.25, end_fraction=0.75
     )
-    assert scheduler.probability(0) == pytest.approx(0.9)
-    assert scheduler.probability(10) == pytest.approx(0.9)
-    assert 0.1 < scheduler.probability(60) < 0.9
-    assert scheduler.probability(110) == pytest.approx(0.1)
-    assert scheduler.probability(1000) == pytest.approx(0.1)
+    assert scheduler.sigma(0) == pytest.approx(5.0)
+    assert scheduler.sigma(49_999) == pytest.approx(5.0)
+    assert scheduler.sigma(50_000) == pytest.approx(5.0)
+    assert scheduler.sigma(100_000) == pytest.approx(2.5)
+    assert scheduler.sigma(149_999) > 0
+    assert scheduler.sigma(150_000) == pytest.approx(0.0)
+    assert scheduler.sigma(200_000) == pytest.approx(0.0)
+    assert scheduler.sigma(300_000) == pytest.approx(0.0)
 
 
-def test_piecewise_scheduler_and_mask_scopes():
-    scheduler = MaskProbabilityScheduler(
-        schedule_type="piecewise",
-        piecewise_steps=[0, 10, 20],
-        piecewise_probabilities=[1.0, 0.5, 0.0],
-    )
-    assert scheduler.probability(5) == pytest.approx(0.75)
+def test_factr_blur_scheduler_scales_with_total_steps():
+    scheduler = FactrBlurScheduler(total_steps=100_000, start_fraction=0.1, end_fraction=0.8)
+    assert scheduler.sigma(0) == pytest.approx(5.0)
+    assert scheduler.sigma(10_000) == pytest.approx(5.0)
+    assert scheduler.sigma(45_000) == pytest.approx(2.5)
+    assert scheduler.sigma(79_999) > 0
+    assert scheduler.sigma(80_000) == pytest.approx(0.0)
+    assert scheduler.sigma(100_000) == pytest.approx(0.0)
+    assert scheduler.sigma(120_000) == pytest.approx(0.0)
+
+
+def test_factr_blur_scheduler_waits_for_runtime_training_budget():
+    scheduler = FactrBlurScheduler(start_fraction=0.1, end_fraction=0.8)
+    assert scheduler.auto_total_steps
+    with pytest.raises(RuntimeError, match="optimizer-step budget"):
+        scheduler.sigma(0)
+    scheduler.set_total_steps(200)
+    assert scheduler.sigma(20) == pytest.approx(5.0)
+    assert scheduler.sigma(90) == pytest.approx(2.5)
+    assert scheduler.sigma(160) == pytest.approx(0.0)
+
+
+def test_contact_blur_scope_is_deterministic():
     contact = torch.tensor([[False, True], [True, False]])
-    current = ContactAwareImageMasker("current_observation")(
-        contact, probability=1.0
-    )
-    full = ContactAwareImageMasker("full_context")(contact, probability=1.0)
+    current = select_contact_blur_mask(contact, "current_observation")
+    full = select_contact_blur_mask(contact, "full_context")
     assert current.tolist() == [[False, True], [False, False]]
     assert full.tolist() == [[True, True], [False, False]]
 
 
-def test_contact_mask_curriculum_milestones_match_quarters_of_200k_steps():
-    scheduler = MaskProbabilityScheduler(
-        schedule_type="piecewise",
-        piecewise_steps=[0, 50_000, 150_000, 200_000],
-        piecewise_probabilities=[1.0, 1.0, 0.0, 0.0],
-        piecewise_interpolation="linear",
-    )
-    assert scheduler.probability(0) == pytest.approx(1.0)
-    assert scheduler.probability(49_999) == pytest.approx(1.0)
-    assert scheduler.probability(50_000) == pytest.approx(1.0)
-    assert scheduler.probability(100_000) == pytest.approx(0.5)
-    assert scheduler.probability(149_999) == pytest.approx(1e-5)
-    assert scheduler.probability(150_000) == pytest.approx(0.0)
-    assert scheduler.probability(199_999) == pytest.approx(0.0)
-    assert scheduler.probability(200_000) == pytest.approx(0.0)
-
-
-def test_blur_curriculum_reduces_sigma_until_exactly_clear():
-    scheduler = BlurSigmaScheduler(
-        schedule_type="piecewise",
-        piecewise_steps=[0, 50_000, 150_000, 200_000],
-        piecewise_sigmas=[5, 5, 0, 0],
-    )
-    assert [scheduler.sigma(step) for step in (0, 50_000, 100_000, 150_000, 200_000)] == [5, 5, 2.5, 0, 0]
-    assert scheduler(100_000) == 2.5
-    assert scheduler.sigma(149_999) > 0
-
-
-def test_gaussian_blur_matches_standard_filter_and_restores_original():
-    from torchvision.transforms.functional import gaussian_blur
-
+def test_factr_gaussian_smoothing_uses_zero_padded_2d_kernel():
     images = torch.rand(2, 2, 3, 16, 24)
-    expected = gaussian_blur(images.flatten(0, 1), kernel_size=7, sigma=1.0).reshape_as(images)
-    torch.testing.assert_close(gaussian_blur_images(images, 1.0), expected)
-    assert gaussian_blur_images(images, 0) is images
-    torch.testing.assert_close(gaussian_blur_images(torch.ones_like(images), 10), torch.ones_like(images))
-    # Stronger blur suppresses spatial variation, rather than discarding RGB.
+    blurred = gaussian_2d_smoothing(images, 1.0)
+    assert blurred.shape == images.shape
+    assert blurred.dtype == images.dtype
+    assert gaussian_2d_smoothing(images, 0) is images
+    # Zero padding is part of FACTR's implementation, so a constant image
+    # loses mass at the border instead of remaining exactly constant.
+    constant = torch.ones(1, 3, 16, 16)
+    assert gaussian_2d_smoothing(constant, 1.0).mean() < 1.0
     impulse = torch.zeros(1, 3, 64, 64)
     impulse[:, :, 32, 32] = 1
-    assert gaussian_blur_images(impulse, 10).max() < gaussian_blur_images(impulse, 5).max() < impulse.max()
+    assert gaussian_2d_smoothing(impulse, 10).max() < gaussian_2d_smoothing(impulse, 5).max()
 
 
 @pytest.mark.parametrize("temporal_encoder", ["gru", "lstm", "transformer", "none"])
@@ -443,7 +449,6 @@ def test_force_encoder_returns_eight_tokens_per_observation(temporal_encoder):
     context = encoder(
         image=torch.rand(2, 2, 3, 16, 16),
         wrench_history=torch.randn(2, 2, 8, 6),
-        image_token_mask=torch.tensor([[False, True], [False, False]]),
     )
     assert context.shape == (2, 16, 16)
     assert not encoder.backbone.training
@@ -461,7 +466,6 @@ def test_force_encoder_encodes_every_configured_camera():
             "side": torch.rand(2, 2, 3, 16, 16),
         },
         wrench_history=torch.randn(2, 2, 8, 6),
-        image_token_mask=torch.tensor([[False, True], [False, False]]),
     )
     assert encoder.image_keys == ("side", "wrist")
     assert encoder.backbone.forward_calls == 1
@@ -568,22 +572,20 @@ def test_pre_cross_self_attention_splits_updated_image_and_wrench_tokens(camera_
 
 
 @pytest.mark.parametrize("camera_mode", ["joint", "per_camera"])
-def test_pre_cross_self_attention_preserves_image_mask(camera_mode):
+def test_pre_cross_self_attention_keeps_image_inputs(camera_mode):
     encoder = make_obs_encoder(
         image_keys=("wrist", "side"), camera_attention_mode=camera_mode,
         pre_cross_self_attn_layers=1,
     ).eval()
     wrench = torch.randn(1, 2, 8, 6)
+    images = {key: torch.rand(1, 2, 3, 16, 16) for key in ("side", "wrist")}
+    changed = {key: value + 1.0 for key, value in images.items()}
     with torch.inference_mode():
-        first = encoder(
-            images={key:torch.rand(1, 2, 3, 16, 16) for key in ("side", "wrist")},
-            wrench_history=wrench, image_token_mask=torch.ones(1, 2, dtype=torch.bool),
-        )
-        second = encoder(
-            images={key:torch.rand(1, 2, 3, 16, 16) for key in ("side", "wrist")},
-            wrench_history=wrench, image_token_mask=torch.ones(1, 2, dtype=torch.bool),
-        )
-    torch.testing.assert_close(first, second, rtol=0, atol=0)
+        first = encoder(images=images, wrench_history=wrench)
+        same = encoder(images=images, wrench_history=wrench)
+        second = encoder(images=changed, wrench_history=wrench)
+    torch.testing.assert_close(first, same, rtol=0, atol=0)
+    assert not torch.allclose(first, second)
 
 
 def test_pre_cross_self_attention_trains_and_checkpoint_restores():
@@ -669,7 +671,7 @@ def test_context_transformer_output_shape():
     assert output.shape == (3, 8, 7)
 
 
-def test_policy_loss_masks_training_contact_and_backpropagates():
+def test_policy_loss_trains_contact_and_backpropagates():
     policy = make_policy()
     policy.train()
     batch = {
@@ -683,7 +685,7 @@ def test_policy_loss_masks_training_contact_and_backpropagates():
     loss = policy.compute_loss(batch, optimizer_step=0)
     assert loss.ndim == 0 and torch.isfinite(loss)
     assert policy.last_curriculum_metrics["curriculum/contact_fraction"] == pytest.approx(0.25)
-    assert policy.last_curriculum_metrics["curriculum/masked_image_fraction"] == pytest.approx(0.5)
+    assert policy.last_curriculum_metrics["curriculum/blurred_image_fraction"] == pytest.approx(0.0)
     loss.backward()
     assert policy.model.output_head.weight.grad is not None
     assert all(
@@ -691,8 +693,17 @@ def test_policy_loss_masks_training_contact_and_backpropagates():
     )
 
 
-def test_policy_masking_uses_future_contact_for_future_phase_windows():
-    policy = make_policy(future_phase=True)
+def test_policy_blur_uses_future_contact_for_future_phase_windows():
+    policy = make_policy(
+        future_phase=True,
+        image_blur_schedule={
+            "total_steps": 100,
+            "start_sigma": 3,
+            "end_sigma": 0,
+            "start_fraction": 0.25,
+            "end_fraction": 0.75,
+        },
+    )
     policy.train()
     batch = {
         "obs": {
@@ -711,13 +722,14 @@ def test_policy_masking_uses_future_contact_for_future_phase_windows():
     assert loss.ndim == 0 and torch.isfinite(loss)
     assert policy.last_curriculum_metrics["curriculum/contact_fraction"] == pytest.approx(0.0)
     assert policy.last_curriculum_metrics["curriculum/future_contact_fraction"] == pytest.approx(0.5)
-    # full_context masks both observation images for only the first sample.
-    assert policy.last_curriculum_metrics["curriculum/masked_image_fraction"] == pytest.approx(0.5)
+    # full_context blurs both observation images for only the first sample.
+    assert policy.last_curriculum_metrics["curriculum/blurred_image_fraction"] == pytest.approx(0.5)
 
 
 def test_policy_blur_uses_future_contact_and_preserves_free_rgb():
     policy = make_policy(future_phase=True, image_blur_schedule={
-        "schedule_type": "linear", "start_sigma": 3, "end_sigma": 0, "end_step": 100,
+        "total_steps": 100, "start_sigma": 3, "end_sigma": 0,
+        "start_fraction": 0.25, "end_fraction": 0.75,
     }).train()
     obs = {
         "wrist": torch.rand(2, 2, 3, 16, 16),
@@ -738,11 +750,11 @@ def test_policy_blur_uses_future_contact_and_preserves_free_rgb():
     assert not torch.equal(captured[0][0], obs["wrist"][0])
     torch.testing.assert_close(captured[0][1], obs["wrist"][1], rtol=0, atol=0)
     assert policy.last_curriculum_metrics["curriculum/blurred_image_fraction"] == 0.5
-    assert policy.last_curriculum_metrics["curriculum/masked_image_fraction"] == 0
 
 
-def test_policy_prediction_is_unmasked_and_returns_eight_action_steps():
-    policy = make_policy()
+@pytest.mark.parametrize("action_dim", [7, 8])
+def test_policy_prediction_is_clear_and_returns_eight_action_steps(action_dim):
+    policy = make_policy(action_dim=action_dim)
     policy.eval()
     obs = {
         "wrist": torch.rand(2, 2, 3, 16, 16),
@@ -750,25 +762,71 @@ def test_policy_prediction_is_unmasked_and_returns_eight_action_steps():
     }
     obs["wrench_ext"][:, -1, -1, 0] = 10.0
     result = policy.predict_action(obs, generator=torch.Generator().manual_seed(1))
-    assert result["action_pred"].shape == (2, 9, 7)
-    assert result["action"].shape == (2, 8, 7)
+    assert result["action_pred"].shape == (2, 9, action_dim)
+    assert result["action"].shape == (2, 8, action_dim)
     assert "action_target" not in result
     assert torch.allclose(
         torch.linalg.vector_norm(result["action"][..., 3:7], dim=-1),
         torch.ones(2, 8),
         atol=1e-5,
     )
-    assert policy.last_curriculum_metrics["curriculum/masked_image_fraction"] == 0.0
+    assert policy.last_curriculum_metrics["curriculum/blurred_image_fraction"] == 0.0
 
 
-def test_pose_quaternion_normalization_has_identity_fallback():
-    action = torch.zeros(1, 2, 7)
+def test_joint_position_prediction_preserves_joint_angles_and_gripper(monkeypatch):
+    policy = make_policy(action_dim=8, action_representation="joint_position")
+    policy.eval()
+    # Joint angles 4--7 must not be projected onto a unit quaternion.
+    target = torch.tensor([0.1, -0.4, 0.2, -2.4, 0.3, 1.8, 0.7, -1.0]).repeat(2, 9, 1)
+    normalized = policy.normalizer["action"].normalize(target)
+    monkeypatch.setattr(policy, "conditional_sample", lambda *args, **kwargs: normalized)
+    obs = {
+        "wrist": torch.rand(2, 2, 3, 16, 16),
+        "wrench_ext": torch.zeros(2, 2, 8, 6),
+    }
+    result = policy.predict_action(obs)
+    torch.testing.assert_close(result["model_action_pred"], target)
+    torch.testing.assert_close(result["action"], target[:, 1:9])
+
+
+def test_per_window_generators_keep_prediction_stable_across_batch_splits():
+    policy = make_policy()
+    policy.eval()
+    obs = {
+        "wrist": torch.rand(3, 2, 3, 16, 16),
+        "wrench_ext": torch.zeros(3, 2, 8, 6),
+    }
+    seeds = [17, 2026, 99]
+    def predict(indices):
+        return policy.predict_action(
+            {key: value[indices] for key, value in obs.items()},
+            generator=[torch.Generator().manual_seed(seeds[i]) for i in indices],
+        )["action_pred"]
+    with torch.no_grad():
+        combined = predict([0, 1, 2])
+        split = torch.cat([predict([0]), predict([1, 2])])
+        reordered = predict([2, 0, 1])
+    torch.testing.assert_close(combined, split, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(combined[[2, 0, 1]], reordered, atol=1e-5, rtol=1e-5)
+
+
+def test_joint_position_actions_cannot_use_relative_pose_transform():
+    with pytest.raises(ValueError, match="relative_pose_actions requires action_representation"):
+        make_policy(relative_pose_actions=True, action_representation="joint_position")
+
+
+@pytest.mark.parametrize("action_dim", [7, 8])
+def test_pose_quaternion_normalization_has_identity_fallback(action_dim):
+    action = torch.zeros(1, 2, action_dim)
+    if action_dim == 8:
+        action[..., 7] = torch.tensor([-1.0, 1.0])
     action[0, 1, 3:7] = torch.tensor([0.0, 0.0, 0.0, 2.0])
     normalized = normalize_pose_quaternions(action)
     assert torch.allclose(
         normalized[..., 3:7],
         torch.tensor([[[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]]]),
     )
+    torch.testing.assert_close(normalized[..., 7:], action[..., 7:])
 
 
 def test_relative_pose_round_trip_and_quaternion_sign_invariance():

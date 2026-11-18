@@ -27,33 +27,20 @@ def test_workspace_cleans_only_its_teacher_cache_on_completion_and_errors(monkey
     unrelated = cache_parent / "another-teacher"
     unrelated.mkdir(parents=True)
     (unrelated / "keep.npy").write_bytes(b"another run's targets")
-    teacher_cfg = OmegaConf.create({
-        "policy": {"test": True, "dino_model_name_or_path": "old-project/backbone"},
-        "task": {"dataset": {"dataset_path": "old-project/dataset"}},
-    })
+    teacher_cfg = OmegaConf.create({"policy": {"test": True}, "task": {"dataset": {}}})
     monkeypatch.setattr(distill, "load_checkpoint_payload", lambda _: ({"state_dicts": {}}, teacher_cfg))
-
-    def load_teacher(payload, teacher_config, *args, **kwargs):
-        assert teacher_config.policy.dino_model_name_or_path == str(tmp_path / "backbone")
-        return TinyTeacher()
-
-    def load_dataset(dataset_config):
-        assert dataset_config.dataset_path == str(source)
-        return TinyDataset(source)
-
-    monkeypatch.setattr(distill, "instantiate_policy", load_teacher)
+    monkeypatch.setattr(distill, "instantiate_policy", lambda *a, **kw: TinyTeacher())
     monkeypatch.setattr(distill, "build_render_net", lambda *a: TinyRenderer())
     monkeypatch.setattr(distill.WrenchPreprocessor, "from_policy", lambda policy: TinyPreprocessor())
-    monkeypatch.setattr(distill.hydra.utils, "instantiate", load_dataset)
+    monkeypatch.setattr(distill.hydra.utils, "instantiate", lambda _: TinyDataset(source))
     cfg = OmegaConf.load(Path(__file__).resolve().parents[1] /
-                         "diffusion_policy/config/train_distill_render_net.yaml")
+                         "diffusion_policy/config/train_distill_render_net_student.yaml")
     del cfg["hydra"]
+    cfg.distillation.objective = "token_mse" # Cache lifecycle uses the legacy obs-only test policy.
     assert cfg.teacher_cache.cleanup_on_exit is True
     # Old saved configs must get the new default as well.
     del cfg.teacher_cache.cleanup_on_exit
     cfg.teacher_checkpoint = str(checkpoint)
-    cfg.dino_model_path = str(tmp_path / "backbone")
-    cfg.dataset_path = str(source)
     cfg.teacher_cache.directory = str(cache_parent)
     cfg.teacher_cache.batch_size = 2
     cfg.teacher_cache.num_workers = 1
@@ -64,6 +51,8 @@ def test_workspace_cleans_only_its_teacher_cache_on_completion_and_errors(monkey
     cfg.training.num_epochs = 1
     cfg.render_net.architecture_version = 1
     cfg.render_net.high_attention_render.enabled = False
+    cfg.render_net.phase_predictor.enabled = False
+    cfg.training.render_stages = {"enabled": False, "transition": "epoch"}
     cfg.logging.progress_bar = False
     cfg.logging.plot_every_steps = 0
     for loader in (cfg.dataloader, cfg.val_dataloader):

@@ -1,0 +1,5 @@
+# Compatibility name: the unified three-stage CIVI student.
+defaults:
+  - train_distill_render_net_student
+  - _self_
+name: train_distill_render_net_board_legacy

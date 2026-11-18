@@ -57,7 +57,7 @@ def test_render_net_starts_as_identity_and_handles_different_image_sizes(backbon
     model = RenderNet(wrench_dim=6, base_channels=4, conditioning_dim=8, backbone=backbone,
                       conv_block=conv_block,
                       wrench_history_steps=7,
-                      transformer={"embed_dim": 16, "depth": 2, "patch_size": 8, "num_heads": 4},
+                      embed_dim=16, image_self_attn_layers=2, cross_attn_layers=2, patch_size=8, num_heads=4,
                       high_attention_render={"enabled": region_enabled})
     images = {"side": torch.rand(2, 2, 3, 17, 25), "wrist": torch.rand(2, 2, 3, 20, 28)}
     rendered = model(images, torch.randn(2, 2, 7, 6))
@@ -73,7 +73,7 @@ def test_teacher_lstm_initialization_preserves_all_temporal_outputs_without_shar
     ).eval().requires_grad_(False)
     renderer = RenderNet(
         6, base_channels=4, conditioning_dim=16, wrench_history_steps=7, wrench_layers=2,
-        image_keys=["wrist"], transformer={"embed_dim": 16, "depth": 1, "patch_size": 8},
+        image_keys=["wrist"], embed_dim=16, image_self_attn_layers=1, cross_attn_layers=1, patch_size=8,
     ).eval()
     renderer.initialize_wrench_encoder(teacher)
     wrench = torch.randn(2, 2, 7, 6)
@@ -97,7 +97,7 @@ def test_patch_queries_read_full_wrench_sequence_and_backpropagate_to_early_time
     torch.manual_seed(12)
     renderer = RenderNet(
         6, base_channels=4, conditioning_dim=8, wrench_history_steps=7, backbone=backbone,
-        transformer={"embed_dim": 16, "depth": 1, "patch_size": 8, "num_heads": 4},
+        embed_dim=16, image_self_attn_layers=1, cross_attn_layers=1, patch_size=8, num_heads=4,
     )
     with torch.no_grad():
         renderer.output.weight.normal_(std=0.03)
@@ -125,7 +125,7 @@ def test_camera_identity_changes_rendering_without_depending_on_dictionary_order
     torch.manual_seed(13)
     renderer = RenderNet(
         6, base_channels=4, conditioning_dim=8,
-        transformer={"embed_dim": 16, "depth": 1, "patch_size": 8},
+        embed_dim=16, image_self_attn_layers=1, cross_attn_layers=1, patch_size=8,
     ).eval()
     with torch.no_grad():
         renderer.output.weight.normal_(std=0.03)
@@ -143,7 +143,10 @@ def test_camera_identity_changes_rendering_without_depending_on_dictionary_order
 @pytest.mark.parametrize("backbone", ["unet", "transformer"])
 @pytest.mark.parametrize("region_enabled", [False, True])
 @pytest.mark.parametrize("conv_block", ["standard", "bottleneck"])
-def test_frozen_visual_path_trains_renderer_and_conditioner_without_teacher_fusion(backbone, region_enabled, conv_block):
+@pytest.mark.parametrize("use_teacher_ffn", [False, True])
+def test_frozen_visual_path_trains_renderer_and_conditioner_without_teacher_fusion(
+    backbone, region_enabled, conv_block, use_teacher_ffn,
+):
     torch.manual_seed(42)
     teacher = nn.Module()
     attach_preprocessing(teacher)
@@ -154,7 +157,7 @@ def test_frozen_visual_path_trains_renderer_and_conditioner_without_teacher_fusi
     teacher.normalizer.fit({"wrench": torch.randn(32, 6)})
     teacher.obs_encoder = ForceAwareObsEncoder(
         "unused", backbone=PatchBackbone(), n_emb=16, n_head=4, max_obs_steps=2,
-        wrench_history_steps=7, cross_attn_query="image", dropout=0.0,
+        wrench_history_steps=7, cross_attn_query="image", cross_attn_layers=2, dropout=0.0,
         force_temporal_encoder="lstm",
         image_shapes={"side": (3, 16, 16), "wrist": (3, 16, 24)},
     )
@@ -174,18 +177,19 @@ def test_frozen_visual_path_trains_renderer_and_conditioner_without_teacher_fusi
     handles = [module.register_forward_pre_hook(forbidden) for module in (
         teacher.obs_encoder.wrench_projection, teacher.obs_encoder.force_encoder,
         teacher.obs_encoder.cross_attention, teacher.model,
+        teacher.obs_encoder.extra_cross_attention_layers[0].cross_attention,
     )]
     try:
         renderer = RenderNet(wrench_dim=6, base_channels=4, conditioning_dim=16, backbone=backbone,
                              conv_block=conv_block,
                              wrench_history_steps=7,
-                             transformer={"embed_dim": 16, "depth": 2, "patch_size": 8, "num_heads": 4},
+                             embed_dim=16, image_self_attn_layers=2, cross_attn_layers=2, patch_size=8, num_heads=4,
                              high_attention_render={"enabled": region_enabled}).train()
         renderer.initialize_wrench_encoder(teacher.obs_encoder)
         optimizer = torch.optim.AdamW(renderer.parameters(), lr=1e-3)
         for step in range(2):
             optimizer.zero_grad(set_to_none=True)
-            tokens = student_context_tokens(teacher, renderer, obs)
+            tokens = student_context_tokens(teacher, renderer, obs, use_teacher_ffn=use_teacher_ffn)
             assert tokens.shape == target.shape == (2, 20, 16)
             F.mse_loss(tokens, target).backward()
             assert renderer.output.weight.grad.abs().sum() > 0
@@ -204,7 +208,8 @@ def test_frozen_visual_path_trains_renderer_and_conditioner_without_teacher_fusi
             handle.remove()
 
 
-def test_compiled_student_preserves_context_gradients_and_portable_state_dict():
+@pytest.mark.parametrize("use_teacher_ffn", [False, True])
+def test_compiled_student_preserves_context_gradients_and_portable_state_dict(use_teacher_ffn):
     torch.manual_seed(13)
     teacher = nn.Module()
     attach_preprocessing(teacher)
@@ -213,13 +218,13 @@ def test_compiled_student_preserves_context_gradients_and_portable_state_dict():
     teacher.normalizer.fit({"wrench": torch.randn(32, 6)})
     teacher.obs_encoder = ForceAwareObsEncoder(
         "unused", backbone=PatchBackbone(), n_emb=16, n_head=4, max_obs_steps=2,
-        wrench_history_steps=7, cross_attn_query="image", dropout=0.0,
+        wrench_history_steps=7, cross_attn_query="image", cross_attn_layers=2, dropout=0.0,
         image_shapes={"side": (3, 16, 16), "wrist": (3, 16, 24)},
     )
     teacher.eval().requires_grad_(False)
     eager = RenderNet(
         6, base_channels=4, conditioning_dim=16, wrench_history_steps=7, conv_block="bottleneck",
-        transformer={"embed_dim": 16, "depth": 1, "patch_size": 8},
+        embed_dim=16, image_self_attn_layers=1, cross_attn_layers=1, patch_size=8,
         high_attention_render={"enabled": True},
     )
     with torch.no_grad():
@@ -230,8 +235,9 @@ def test_compiled_student_preserves_context_gradients_and_portable_state_dict():
                            backend="aot_eager", fullgraph=True, dynamic=False)
     obs = {"side": torch.rand(2, 2, 3, 16, 16), "wrist": torch.rand(2, 2, 3, 16, 24),
            "wrench": torch.randn(2, 2, 7, 6)}
-    expected = student_context_tokens(teacher, eager, obs)
-    actual = student_context_tokens(teacher, compiled, obs, image_context_encoder=encode)
+    expected = student_context_tokens(teacher, eager, obs, use_teacher_ffn=use_teacher_ffn)
+    actual = student_context_tokens(teacher, compiled, obs, image_context_encoder=encode,
+                                    use_teacher_ffn=use_teacher_ffn)
     torch.testing.assert_close(actual, expected)
     target = torch.randn_like(expected)
     F.mse_loss(expected, target).backward()
@@ -239,6 +245,10 @@ def test_compiled_student_preserves_context_gradients_and_portable_state_dict():
     assert compiled.state_dict().keys() == eager.state_dict().keys()
     for name, parameter in compiled.named_parameters():
         reference = dict(eager.named_parameters())[name]
+        # The detached region gate is intentionally outside the RGB loss graph.
+        if reference.grad is None:
+            assert parameter.grad is None
+            continue
         assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
         torch.testing.assert_close(parameter.grad, reference.grad, rtol=2e-4, atol=1e-6)
     assert compiled.wrench_encoder.weight_ih_l0.grad.abs().sum() > 0
@@ -252,14 +262,50 @@ def test_compiled_student_preserves_context_gradients_and_portable_state_dict():
     restored = copy.deepcopy(eager).eval()
     restored.load_state_dict(compiled.state_dict(), strict=True)
     with torch.no_grad():
-        torch.testing.assert_close(student_context_tokens(teacher, compiled, obs),
-                                   student_context_tokens(teacher, restored, obs))
+        torch.testing.assert_close(
+            student_context_tokens(teacher, compiled, obs, use_teacher_ffn=use_teacher_ffn),
+            student_context_tokens(teacher, restored, obs, use_teacher_ffn=use_teacher_ffn),
+        )
+
+
+@pytest.mark.parametrize("layers", [1, 2])
+def test_teacher_ffn_supervision_matches_closed_teacher_without_rendering(layers):
+    torch.manual_seed(7)
+    teacher = nn.Module()
+    attach_preprocessing(teacher)
+    teacher.image_keys = ("side", "wrist")
+    teacher.normalizer = LinearNormalizer()
+    teacher.normalizer.fit({"wrench": torch.randn(32, 6)})
+    teacher.obs_encoder = ForceAwareObsEncoder(
+        "unused", backbone=PatchBackbone(), n_emb=16, n_head=4, max_obs_steps=2,
+        wrench_history_steps=7, cross_attn_query="image", cross_attn_layers=layers,
+        dropout=0.0, image_shapes={"side": (3, 16, 16), "wrist": (3, 16, 24)},
+    )
+    teacher.eval().requires_grad_(False)
+    obs = {"side": torch.rand(2, 2, 3, 16, 16), "wrist": torch.rand(2, 2, 3, 16, 24),
+           "wrench": torch.randn(2, 2, 7, 6), "contact_alpha": torch.zeros(2, 2)}
+    renderer = RenderNet(
+        6, base_channels=4, conditioning_dim=16, wrench_history_steps=7,
+        embed_dim=16, image_self_attn_layers=1, cross_attn_layers=1, patch_size=8,
+    ).eval()
+    with torch.no_grad():
+        renderer.output.bias.fill_(0.5)
+        images, wrench, _, _ = teacher.prepare_context_inputs(obs)
+        target = teacher.obs_encoder(images=images, wrench_history=wrench,
+                                     contact_alpha=obs["contact_alpha"])
+        rendered = renderer(images, wrench, contact_alpha=obs["contact_alpha"])
+        for key in images:
+            torch.testing.assert_close(rendered[key], images[key], rtol=0, atol=0)
+        actual = student_context_tokens(teacher, renderer, obs, use_teacher_ffn=True)
+        original = student_context_tokens(teacher, renderer, obs)
+    torch.testing.assert_close(actual, target, rtol=0, atol=0)
+    assert F.mse_loss(original, target) > 1e-3
 
 
 @pytest.mark.parametrize("backbone", ["unet", "transformer"])
 def test_region_gate_scales_residual_and_can_be_disabled(backbone):
     model = RenderNet(6, base_channels=4, conditioning_dim=8, backbone=backbone,
-                      transformer={"embed_dim": 16, "depth": 1, "patch_size": 8, "num_heads": 4},
+                      embed_dim=16, image_self_attn_layers=1, cross_attn_layers=1, patch_size=8, num_heads=4,
                       high_attention_render={"enabled": True}).eval()
     with torch.no_grad():
         model.output.bias.fill_(0.5)
@@ -278,6 +324,7 @@ def test_region_gate_scales_residual_and_can_be_disabled(backbone):
 
 def test_validation_metric_excludes_auxiliary_region_loss():
     workspace = object.__new__(distill.TrainDistillRenderNetWorkspace)
+    workspace.cfg = OmegaConf.create({"training": {"render_stages": {"transition": "epoch"}}})
     workspace.model = nn.Identity()
     workspace.device = torch.device("cpu")
     workspace.max_val_batches = None
@@ -354,21 +401,39 @@ def test_batched_teacher_targets_match_serial_rollout_and_noise(scheduler_class,
     assert progress == [(0, 2), (2, 2)]
 
 
+def test_residual_free_image_query_uses_query_slot_region_targets():
+    """The old teacher layout must not collapse spatial targets to all ones."""
+    teacher, obs, shapes = make_attention_teacher()
+    teacher.obs_encoder.cross_attn_query_residual = False
+    _, patches = teacher_attention_targets(
+        teacher, obs, percentiles=[80, 99], seed=42, return_patch_attention=True,
+    )
+    for key, shape in shapes.items():
+        values = patches[key]
+        assert values.shape == (2, 2, shape[-2] // 8 * (shape[-1] // 8))
+        assert torch.isfinite(values).all() and (values >= 0).all()
+        assert values.max() > values.min()
+
+
 @pytest.mark.parametrize("region_enabled", [False, True])
 @pytest.mark.parametrize("mode", ["train", "eval", "no_grad", "cached_train"])
 def test_region_supervision_runs_only_on_frozen_teacher_branch(region_enabled, mode):
     teacher, obs, shapes = make_attention_teacher()
-    config = {"enabled": region_enabled, "percentiles": [82.5, 97.3], "teacher_seed": 42}
+    config = {"enabled": region_enabled, "percentiles": [82.5, 97.3], "teacher_seed": 42,
+              "pixel_loss_weight": 2.0}
     workspace = object.__new__(distill.TrainDistillRenderNetWorkspace)
+    workspace.cfg = OmegaConf.create({"training": {"render_stages": {"transition": "epoch"}}})
     workspace.teacher_policy = teacher
     workspace.device = torch.device("cpu")
     workspace.model = RenderNet(6, base_channels=4, conditioning_dim=8, wrench_history_steps=7,
-                               transformer={"embed_dim": 16, "depth": 1, "num_heads": 4},
+                               embed_dim=16, image_self_attn_layers=1, cross_attn_layers=1, num_heads=4,
                                high_attention_render=config)
     workspace.model.train(mode != "eval")
     workspace.attention_config = config
     workspace.attention_enabled = region_enabled
-    workspace.mask_loss_weight = 2.0
+    workspace.context_patch_loss_weight = 0.0
+    workspace.intensity_loss_weight = 1.0
+    workspace.smoothness_loss_weight = 0.0
     workspace.amp_enabled = False
     workspace.shape_info = {}  # Shape logging covered by real checkpoint forward.
     cached_targets = None
@@ -393,10 +458,10 @@ def test_region_supervision_runs_only_on_frozen_teacher_branch(region_enabled, m
         with torch.set_grad_enabled(mode != "no_grad"):
             loss = workspace._loss(obs, cached_targets=cached_targets)
         supervised = region_enabled and mode in {"train", "cached_train"}
-        assert len(calls) == (2 if supervised and mode != "cached_train" else 0)
+        assert len(calls) == (2 if region_enabled and mode != "cached_train" else 0)
         assert workspace.loss_metrics["mask_supervised"] == supervised
         assert loss.item() == pytest.approx(workspace.loss_metrics["token_mse"]
-                                          + 2 * workspace.loss_metrics["mask_mse"])
+                                          + (2 * workspace.loss_metrics["mask_mse"] if supervised else 0))
         if mode in {"train", "cached_train"}:
             loss.backward()
             assert workspace.model.output.weight.grad.abs().sum() > 0
@@ -411,7 +476,7 @@ def test_region_supervision_runs_only_on_frozen_teacher_branch(region_enabled, m
             with torch.no_grad():
                 torch.testing.assert_close(tokens, teacher._encode_context(obs, apply_curriculum_mask=False),
                                            atol=0, rtol=0)
-        elif not supervised:
+        elif not region_enabled:
             assert workspace.loss_metrics["mask_mse"] == 0
         assert not teacher.training
         assert all(not p.requires_grad and p.grad is None for p in teacher.parameters())
@@ -434,8 +499,16 @@ def test_epoch_training_limits_early_stopping_and_best_checkpoint(
     expected_epoch, reason, best_epoch,
 ):
     cfg = OmegaConf.load(Path(__file__).resolve().parents[1] /
-                         "diffusion_policy/config/train_distill_render_net.yaml")
+                         "diffusion_policy/config/train_distill_render_net_student.yaml")
     del cfg["hydra"]  # Hydra removes its own section before invoking the workspace.
+    cfg.distillation.objective = "token_mse" # The loop fixture mocks an obs-only loss.
+    cfg.teacher_checkpoint = str(tmp_path / "teacher.ckpt")
+    cfg.render_net.rendering_mode = "residual"
+    cfg.render_net.high_attention_render.enabled = False
+    # This fixture exercises the original single-objective loop with mocked
+    # observations, not the independently supervised phase/intensity stages.
+    cfg.render_net.phase_predictor.enabled = False
+    cfg.training.render_stages = {"enabled": False, "transition": "epoch"}
     cfg.training.device = "cpu"
     cfg.teacher_cache.enabled = False
     cfg.training.amp.enabled = False
@@ -483,10 +556,17 @@ def test_epoch_training_limits_early_stopping_and_best_checkpoint(
     monkeypatch.setattr(distill.TrainDistillRenderNetWorkspace, "_loss",
                         lambda self, obs: self.model.output.bias.square().mean() + 1.0)
     validation = iter(losses)
+    initial_training_evaluated = False
 
     def validate(self, loader):
+        nonlocal initial_training_evaluated
         self.model.eval()
         self.validation_samples = 5
+        self.validation_metrics = {}
+        self.validation_seconds = 0.0
+        if not initial_training_evaluated:
+            initial_training_evaluated = True
+            return 1.0
         return next(validation)
 
     monkeypatch.setattr(distill.TrainDistillRenderNetWorkspace, "_validate", validate)
@@ -519,12 +599,14 @@ def test_epoch_training_limits_early_stopping_and_best_checkpoint(
                and record["step_seconds"] >= 0 and record["samples_per_second"] > 0 for record in steps)
     epochs_logged = [record for record in records if "epoch_train_mse" in record]
     assert epochs_logged[-1]["epoch_samples"] == (4 if max_steps == 5 else 5)
+    assert summary["metrics_png"] == str((tmp_path / "training_metrics.png").resolve())
     assert (tmp_path / "training_metrics.png").is_file()
 
 
 @pytest.mark.parametrize("max_batches,expected,samples", [(None, 2.6, 5), (2, 2.0, 4)])
 def test_validation_covers_full_split_and_weights_partial_batch(max_batches, expected, samples):
     workspace = object.__new__(distill.TrainDistillRenderNetWorkspace)
+    workspace.cfg = OmegaConf.create({"training": {"render_stages": {"transition": "epoch"}}})
     workspace.model = nn.Identity()
     workspace.device = torch.device("cpu")
     workspace.max_val_batches = max_batches

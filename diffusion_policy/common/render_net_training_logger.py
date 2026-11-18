@@ -3,6 +3,9 @@
 from array import array
 import json
 import math
+import logging
+import multiprocessing as mp
+import numbers
 from pathlib import Path
 
 import numpy as np
@@ -12,16 +15,50 @@ from matplotlib.figure import Figure
 from diffusion_policy.common.json_logger import JsonLogger
 
 
+log = logging.getLogger(__name__)
+
+
 class MetricHistory:
     """Keep only plotted numbers; full records remain in the JSON log."""
 
-    step_keys = ("train_mse", "train_mask_mse", "train_loss", "grad_norm", "lr",
+    step_keys = ("train_mse", "train_token_mse", "train_denoiser_mse", "train_demo_mse",
+                 "train_force_delta_mse", "train_force_delta_loss", "train_context_region_loss",
+                 "train_mask_mse", "train_context_patch_mse", "train_intensity_loss",
+                 "train_intensity_smoothness",
+                 "train_phase_ce", "train_alpha_mse", "train_phase_bce", "train_phase_accuracy",
+                 "train_phase_predicted_open_ratio",
+                 "train_response_mse", "train_student_loss", "train_condition_loss", "train_adapter_mse",
+                 "train_contact_open_ratio", "train_open_token_mse", "train_closed_token_mse",
+                 "train_loss", "grad_norm", "lr",
                  "samples_per_second", "gpu_allocated_mib", "gpu_reserved_mib", "gpu_peak_allocated_mib",
                  "initial_train_mse")
+    region_keys = {"train_mask_mse", "train_context_patch_mse", "train_intensity_loss",
+                   "train_intensity_smoothness"}
+    component_keys = ("token_mse", "denoiser_mse", "demo_mse", "mask_mse",
+                      "force_delta_mse", "force_delta_loss", "context_region_loss",
+                      "context_patch_mse", "intensity_smoothness", "intensity_loss",
+                      "phase_ce", "alpha_mse", "phase_bce", "phase_accuracy", "phase_predicted_open_ratio",
+                      "phase_free_false_open", "phase_precontact_recall", "phase_contact_recall",
+                      "contact_open_ratio", "open_token_mse",
+                      "response_mse", "student_loss", "condition_loss", "adapter_mse",
+                      "closed_token_mse", "loss", "contact_mse", "contact_token_mse",
+                      "contact_response_mse", "contact_denoiser_mse")
+    scope_dependent_keys = {
+        "train_mse", "train_token_mse", "train_denoiser_mse", "train_demo_mse",
+        "train_force_delta_mse", "train_force_delta_loss", "train_context_region_loss",
+        "train_open_token_mse", "train_closed_token_mse", "train_loss",
+        "train_condition_loss", "val_condition_loss", "initial_train_mse", "epoch_train_mse",
+        "val_mse", "epoch_val_mse", "epoch_best_val_mse", "epoch_train_mse_step",
+        "epoch_train_condition_loss",
+    } | region_keys
 
     def __init__(self):
         self.series = {}
         self.step = self.epoch = 0
+        self.objective = "token_mse"
+        self.metric_scope = "all"
+        self.selection_metric = None
+        self.response_loss_weight = None
 
     def _append(self, name, x, y):
         if not math.isfinite(float(y)):
@@ -33,16 +70,114 @@ class MetricHistory:
             xs.append(x)
             ys.append(y)
 
+    @staticmethod
+    def _component_measured(component, metrics):
+        objective = metrics.get("objective")
+        stage = metrics.get("training_stage")
+        if objective == "adapter_warmup" or stage == "adapter":
+            return component in {"adapter_mse", "loss"}
+        if component == "adapter_mse" and (stage is not None or objective is not None):
+            return False
+        if component == "condition_loss" and (stage is not None or objective is not None):
+            return objective == "condition_warmup" or stage == "intensity"
+        return True
+
     def record(self, metrics):
+        scope = metrics.get("metric_scope", self.metric_scope)
+        if scope != self.metric_scope:
+            # Keep the full JSON history, but plot only measurements with the
+            # current selection rule. Auxiliary phase/alpha and runtime
+            # histories remain comparable across this change.
+            for key in self.scope_dependent_keys:
+                self.series.pop(key, None)
+            for key in list(self.series):
+                if (key.startswith(("val_", "epoch_train_", "initial_train_"))
+                        and not key.endswith(("phase_ce", "alpha_mse", "contact_open_ratio"))):
+                    self.series.pop(key)
+            self.metric_scope = scope
+        adapter_warmup = metrics.get("objective") == "adapter_warmup"
+        warmup = metrics.get("objective") == "condition_warmup" or adapter_warmup
+        warmup_component = "adapter_mse" if adapter_warmup else "condition_loss"
+        if "objective" in metrics and not warmup:
+            self.objective = metrics["objective"]
+        if "selection_metric" in metrics:
+            self.selection_metric = metrics["selection_metric"]
+        if "response_loss_weight" in metrics:
+            self.response_loss_weight = metrics["response_loss_weight"]
         step, epoch = metrics.get("global_step", self.step), metrics.get("epoch", self.epoch)
         self.step, self.epoch = step, epoch
+        token_measured = metrics.get("train_token_mse_measured", not warmup)
+        region_count = metrics.get("train_token_region_observation_count",
+                                   metrics.get("token_region_observation_count"))
+        for split in ("train", "val"):
+            prefix = f"initial_{split}_"
+            for component in self.component_keys:
+                key = prefix + component
+                if key not in metrics:
+                    continue
+                if not self._component_measured(component, metrics):
+                    continue
+                if warmup and component in {"token_mse", "denoiser_mse", "response_mse", "student_loss",
+                                            "demo_mse", "open_token_mse", "closed_token_mse"}:
+                    continue
+                if component in {"contact_mse", "contact_token_mse", "contact_response_mse", "contact_denoiser_mse"} and metrics.get(prefix + "contact_samples") == 0:
+                    continue
+                self._append(key if split == "train" else "val_" + component, step, metrics[key])
+        if warmup and "train_mse" in metrics:
+            self._append("train_" + warmup_component, step, metrics["train_mse"])
+        elif warmup and "initial_train_mse" in metrics and not token_measured:
+            self._append("train_" + warmup_component, step, metrics["initial_train_mse"])
+            self._append("initial_train_" + warmup_component, step, metrics["initial_train_mse"])
+        if warmup and "epoch_train_mse" in metrics:
+            self._append("epoch_train_" + warmup_component, step, metrics["epoch_train_mse"])
         for key in self.step_keys:
+            if key.startswith("train_") and not self._component_measured(key.removeprefix("train_"), metrics):
+                continue
+            if (not token_measured and key in {
+                    "train_mse", "train_token_mse", "train_denoiser_mse", "train_demo_mse",
+                    "train_response_mse", "train_student_loss",
+                    "train_open_token_mse", "train_closed_token_mse", "initial_train_mse"}):
+                continue
+            if region_count == 0 and key in self.region_keys:
+                continue
+            if (key == "train_open_token_mse" and metrics.get("train_open_token_count") == 0
+                    or key == "train_closed_token_mse" and metrics.get("train_closed_token_count") == 0):
+                continue
             if key in metrics:
                 self._append(key, step, metrics[key])
-        if "epoch_train_mse" in metrics:
+        for prefix in ("epoch_train_", "val_"):
+            measured = metrics.get("epoch_train_token_mse_measured" if prefix == "epoch_train_"
+                                   else "val_token_mse_measured", not warmup)
+            count_prefix = "epoch_" if prefix == "epoch_train_" else prefix
+            count = metrics.get(count_prefix + "token_region_observation_count")
+            for component in self.component_keys:
+                key = prefix + component
+                if key not in metrics:
+                    continue
+                if not self._component_measured(component, metrics):
+                    continue
+                if component in {"contact_mse", "contact_token_mse", "contact_response_mse", "contact_denoiser_mse"} and metrics.get(prefix + "contact_samples") == 0:
+                    continue
+                if not measured and component in {
+                        "token_mse", "denoiser_mse", "demo_mse", "open_token_mse", "closed_token_mse",
+                        "response_mse", "student_loss"}:
+                    continue
+                if count == 0 and "train_" + component in self.region_keys:
+                    continue
+                if (component in {"open_token_mse", "closed_token_mse"}
+                        and metrics.get(count_prefix + component.replace("mse", "count")) == 0):
+                    continue
+                self._append(key, step, metrics[key])
+        if ("epoch_train_mse" in metrics
+                and metrics.get("epoch_train_token_mse_measured", not warmup)):
             self._append("epoch_train_mse", epoch, metrics["epoch_train_mse"])
+            self._append("epoch_train_mse_step", step, metrics["epoch_train_mse"])
         val = metrics.get("val_mse", metrics.get("initial_val_mse"))
-        if val is not None:
+        val_token_measured = metrics.get("val_token_mse_measured", not warmup)
+        if val is not None and warmup and not val_token_measured:
+            self._append("val_" + warmup_component, step, val)
+        if (val is not None and val_token_measured
+                and metrics.get("val_token_region_observation_count") != 0):
             self._append("val_mse", step, val)
             self._append("epoch_val_mse", epoch, val)
             best = metrics.get("best_val_mse", val)
@@ -51,14 +186,35 @@ class MetricHistory:
     def points(self, key, max_points=4000):
         xs, ys = self.series.get(key, (array("d"), array("d")))
         x, y = np.frombuffer(xs, dtype=np.float64), np.frombuffer(ys, dtype=np.float64)
-        if len(x) > max_points:
+        if max_points is not None and len(x) > max_points:
             selected = np.linspace(0, len(x) - 1, max_points, dtype=int)
             x, y = x[selected], y[selected]
         return x, y
 
+    def train_curve(self, epoch_key, initial_key):
+        """Initial evaluation is the first vertex of the epoch-mean curve."""
+        points = {}
+        for key in (initial_key, epoch_key):
+            if key:
+                x, y = self.points(key, max_points=None)
+                points.update(zip(x, y))
+        ordered = sorted(points.items())
+        return (np.asarray([p[0] for p in ordered]), np.asarray([p[1] for p in ordered]))
+
+    @property
+    def response_weighted(self):
+        if self.response_loss_weight is not None:
+            return self.response_loss_weight > 0
+        return any(np.any(self.points(key)[1] > 0) for key in (
+            "train_response_mse", "epoch_train_response_mse", "val_response_mse"))
+
     @classmethod
     def from_json(cls, path):
         history = cls()
+        if Path(path).suffix == ".json":
+            for record in json.loads(Path(path).read_text())["records"]:
+                history.record(record)
+            return history
         with Path(path).open() as source:
             for line in source:
                 # A live writer may not yet have finished its final record.
@@ -70,79 +226,276 @@ class MetricHistory:
 
 
 def save_training_plot(history, destination):
-    """Render without a display server; atomically replace the current PNG."""
+    """Plot each metric on its own scale, outside the training process."""
     destination = Path(destination)
-    figure = Figure(figsize=(16, 9), constrained_layout=True)
-    FigureCanvasAgg(figure)
-    axes = figure.subplots(2, 3).ravel()
+    force_context = history.selection_metric == "force context loss"
+    metric_label = ("Combined force-context loss" if force_context else
+                    "Denoiser output MSE" if history.objective == "denoiser_mse" else
+                    "Global + response-weighted token MSE" if history.response_weighted
+                    else "Context token MSE")
+    if history.metric_scope == "phases_1_2":
+        metric_label += "\npre-contact / contact"
+    elif history.metric_scope.startswith("anchor_phases_"):
+        names = {"0": "free", "1": "pre-contact", "2": "contact"}
+        phases = history.metric_scope.removeprefix("anchor_phases_").split("_")
+        metric_label += "\n" + " / ".join(names.get(p, p) for p in phases) + " anchors only"
 
-    def curve(axis, key, label, *, factor=1, **kwargs):
+    # A panel contains only one metric. Batch/epoch/validation curves share its
+    # scale; unrelated losses, proportions and runtime measurements never do.
+    panels = [(metric_label, "Loss" if force_context else "MSE",
+               "train_mse", "epoch_train_mse_step", "val_mse", 1.)]
+    if force_context:
+        panels.append(("Context token MSE", "MSE", "train_token_mse",
+                       "epoch_train_token_mse", "val_token_mse", 1.))
+    if history.objective == "denoiser_mse":
+        panels.extend([
+            ("Token MSE (diagnostic)", "MSE", "train_token_mse", "epoch_train_token_mse", "val_token_mse", 1.),
+            ("Demonstration loss", "Loss", "train_demo_mse", "epoch_train_demo_mse", "val_demo_mse", 1.),
+        ])
+    for title, component, ylabel in (
+        ("Force difference MSE (raw)", "force_delta_mse", "MSE"),
+        ("Force difference loss (normalized)", "force_delta_loss", "Loss"),
+        ("Context region RGB loss", "context_region_loss", "Weighted L1"),
+        ("Global context token MSE", "token_mse", "MSE"),
+        ("Teacher response-weighted token MSE", "response_mse", "MSE"),
+        ("Condition warmup loss", "condition_loss", "Loss"),
+        ("Visual baseline calibration", "adapter_mse", "MSE"),
+        ("Contact phase CE", "phase_ce", "Cross entropy"),
+        ("Alpha MSE", "alpha_mse", "MSE"),
+        ("Region patch SmoothL1", "context_patch_mse", "Loss"),
+        ("Region pixel MSE (diagnostic)", "mask_mse", "MSE"),
+        ("Region smoothness", "intensity_smoothness", "Loss"),
+        ("Weighted region loss", "intensity_loss", "Loss"),
+        ("Total training loss", "loss", "Loss"),
+        ("Contact open ratio", "contact_open_ratio", "Fraction"),
+        ("Open-window token MSE", "open_token_mse", "MSE"),
+        ("Closed-window token MSE", "closed_token_mse", "MSE"),
+    ):
+        if force_context and component == "loss":
+            continue
+        if component == "token_mse" and not history.response_weighted:
+            continue
+        panels.append((title, ylabel, "train_" + component,
+                       "epoch_train_" + component, "val_" + component, 1.))
+    for title, key, ylabel, factor in (
+        ("Gradient norm before clipping", "grad_norm", "L2 norm", 1.),
+        ("Learning rate", "lr", "Learning rate", 1.),
+        ("Training throughput", "samples_per_second", "Samples / second", 1.),
+        ("GPU allocated memory", "gpu_allocated_mib", "GiB", 1. / 1024),
+        ("GPU reserved memory", "gpu_reserved_mib", "GiB", 1. / 1024),
+        ("Peak GPU allocated memory", "gpu_peak_allocated_mib", "GiB", 1. / 1024),
+    ):
+        panels.append((title, ylabel, key, None, None, factor))
+    panels = [panel for index, panel in enumerate(panels)
+              if index == 0 or any(key in history.series for key in panel[2:5] if key)]
+    rows = math.ceil(len(panels) / 3)
+    figure = Figure(figsize=(16, 3.45 * rows), constrained_layout=True)
+    FigureCanvasAgg(figure)
+    axes = figure.subplots(rows, 3, squeeze=False).ravel()
+
+    def sparse_line(axis, key, label, color, factor, marker):
+        if key is None:
+            return
         x, y = history.points(key)
         if len(x):
-            axis.plot(x, y * factor, label=label, **kwargs)
+            axis.plot(x, y * factor, label=label, color=color, marker=marker,
+                      markersize=3.8, linewidth=1.25, zorder=4)
 
-    curve(axes[0], "train_mse", "Train batch", alpha=0.65, linewidth=0.8)
-    curve(axes[0], "val_mse", "Validation", marker="o", color="tab:orange")
-    curve(axes[0], "initial_train_mse", "Initial train batch", marker="x", linestyle="none", color="black")
-    curve(axes[1], "epoch_train_mse", "Train epoch mean", marker=".")
-    curve(axes[1], "epoch_val_mse", "Validation", marker=".")
-    curve(axes[1], "epoch_best_val_mse", "Best validation", linestyle="--", color="tab:green")
-    x, y = history.points("epoch_val_mse")
-    if len(x):
-        best = int(np.argmin(y))
-        axes[1].plot(x[best], y[best], "*", color="tab:red", markersize=13,
-                     label=f"Best {y[best]:.6g} @ epoch {x[best]:g}")
-    curve(axes[2], "train_mse", "Token MSE", linewidth=0.9)
-    curve(axes[2], "train_mask_mse", "Region MSE", linewidth=0.9)
-    curve(axes[2], "train_loss", "Total loss", linewidth=0.9)
-    curve(axes[3], "grad_norm", "Gradient norm before clipping", color="tab:purple", linewidth=0.8)
-    curve(axes[4], "lr", "Learning rate", color="tab:green")
-    curve(axes[5], "gpu_allocated_mib", "GPU allocated", factor=1 / 1024, color="tab:blue")
-    curve(axes[5], "gpu_reserved_mib", "GPU reserved", factor=1 / 1024, color="tab:cyan")
-    curve(axes[5], "gpu_peak_allocated_mib", "Peak allocated (run)", factor=1 / 1024,
-          color="tab:blue", linestyle="--")
-    speed_axis = axes[5].twinx()
-    curve(speed_axis, "samples_per_second", "Throughput", color="tab:orange", alpha=0.65)
-    speed_axis.set_ylabel("Samples / second")
-    if speed_axis.lines:
-        speed_axis.legend(loc="upper right", fontsize=8)
-
-    titles = ("Context token MSE", "Train / validation by epoch", "Training loss components",
-              "Gradient norm", "Learning rate", "GPU memory and training throughput")
-    labels = ("MSE", "MSE", "Loss", "L2 norm", "Learning rate", "GiB")
-    for index, axis in enumerate(axes):
-        axis.set(title=titles[index], xlabel="Epoch" if index == 1 else "Optimizer step",
-                 ylabel=labels[index])
-        axis.grid(alpha=0.25)
-        if axis.lines:
-            axis.legend(loc="upper left", fontsize=8)
+    for index, (title, ylabel, train_key, epoch_key, val_key, factor) in enumerate(panels):
+        axis = axes[index]
+        if epoch_key is not None:
+            initial_key = "initial_train_mse" if index == 0 else "initial_" + train_key
+            x, y = history.train_curve(epoch_key, initial_key)
+            if len(x):
+                axis.plot(x, y * factor, color="tab:blue", marker="o", markersize=3.8,
+                          linewidth=1.5, label="Train loss" if ylabel in {"MSE", "Loss", "Cross entropy", "Weighted L1"} else "Train")
+            sparse_line(axis, val_key, "Validation loss" if ylabel in {"MSE", "Loss", "Cross entropy", "Weighted L1"} else "Validation",
+                        "tab:orange", factor, "o")
         else:
-            axis.text(0.5, 0.5, "Waiting for training metrics", ha="center", va="center",
-                      transform=axis.transAxes, color="gray")
+            x, y = history.points(train_key)
+            if len(x):
+                axis.plot(x, y * factor, color="tab:blue", linewidth=1.1, label="Measured")
+        axis.set(title=title, xlabel="Optimizer step", ylabel=ylabel)
+        axis.title.set_fontsize(11)
+        axis.tick_params(labelsize=8)
+        axis.grid(alpha=.2)
+        axis.margins(x=.015, y=.08)
+        if train_key == "lr":
+            axis.ticklabel_format(axis="y", style="plain", useOffset=False)
+            if len(y) and np.ptp(y) <= np.max(np.abs(y)) * 1e-6:
+                center = float(np.mean(y))
+                margin = max(abs(center) * .05, 1e-9)
+                axis.set_ylim(center - margin, center + margin)
+        if axis.lines:
+            # A shared color convention makes panels easy to compare; compact
+            # legends explain only the curves actually present in this panel.
+            if len(axis.lines) > 1:
+                axis.legend(loc="best", fontsize=7.5, framealpha=.8)
+        else:
+            axis.text(.5, .5, "Waiting for measured metrics", ha="center", va="center",
+                      transform=axis.transAxes, color="gray", fontsize=9)
+    for axis in axes[len(panels):]:
+        axis.set_visible(False)
     figure.suptitle(f"RenderNet distillation | epoch {history.epoch:g} | step {history.step:g}", fontsize=15)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(".tmp.png")
     figure.savefig(temporary, dpi=140)
     temporary.replace(destination)
     figure.clear()
+    save_contact_plot(history, destination.parent / "contact_loss.png")
     return destination
 
 
+
+def save_contact_plot(history, destination):
+    """Contact anchors only, using the same primary objective as the main plot."""
+    tx, ty = history.train_curve("epoch_train_contact_mse", "initial_train_contact_mse")
+    vx, vy = history.points("val_contact_mse")
+    if not len(tx) and not len(vx):
+        return None
+    figure = Figure(figsize=(9, 5.2), constrained_layout=True)
+    FigureCanvasAgg(figure)
+    axis = figure.subplots()
+    if len(tx):
+        axis.plot(tx, ty, "o-", color="tab:blue", label="Train loss", linewidth=1.6, markersize=4)
+    if len(vx):
+        axis.plot(vx, vy, "o-", color="tab:orange", label="Validation loss", linewidth=1.6, markersize=4)
+    objective = ("Frozen DiT output MSE" if history.objective == "denoiser_mse"
+                 else "Global + response-weighted token MSE" if history.response_weighted
+                 else "Token alignment loss")
+    axis.set(title="Contact-stage loss | measured anchor phase = 2\n" + objective,
+             xlabel="Optimizer step", ylabel="Loss")
+    axis.grid(alpha=.2)
+    axis.legend()
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(".tmp.png")
+    figure.savefig(temporary, dpi=160)
+    temporary.replace(destination)
+    figure.clear()
+    return destination
+
+
+def is_curve_record(record):
+    return (any(key.startswith(("initial_", "epoch_train_")) for key in record)
+            or "val_mse" in record or "metric_scope" in record)
+
+
+def save_curve_log(records, destination):
+    """A standard JSON document for plotting; detailed batch logs stay in JSONL."""
+    destination = Path(destination)
+    document = {
+        "contact_scope": "contact_phase at current observation anchor equals 2; full output of selected samples",
+        "train_curve": "initial evaluation (see initial_train_samples), then epoch training means",
+        "validation_curve": "initial evaluation, then fixed-probe validation means; EMA when enabled",
+        "contact_normalization": "sample sums / contact sample count; response numerator / response weight sum",
+        "records": records,
+    }
+    temporary = destination.with_suffix(".tmp.json")
+    temporary.write_text(json.dumps(document, indent=2, allow_nan=False) + "\n")
+    temporary.replace(destination)
+
+
+def export_curve_log(log_path, destination):
+    records = []
+    with Path(log_path).open() as stream:
+        for line in stream:
+            if not line.endswith("\n"):
+                break
+            if line.strip():
+                record = json.loads(line)
+                if is_curve_record(record):
+                    records.append(record)
+    save_curve_log(records, destination)
+    return records
+
+
+def _plot_worker(log_path, destination, request_event, stop_event, poll_seconds):
+    """Render plots outside the training process and never block optimizer steps."""
+    log_path = Path(log_path)
+    destination = Path(destination)
+    last_mtime = None
+    while True:
+        requested = request_event.wait(float(poll_seconds))
+        request_event.clear()
+        stopping = stop_event.is_set()
+        try:
+            mtime = log_path.stat().st_mtime_ns
+            if requested or stopping or mtime != last_mtime:
+                history = MetricHistory.from_json(log_path)
+                save_training_plot(history, destination)
+                last_mtime = mtime
+        except (FileNotFoundError, ValueError, json.JSONDecodeError):
+            # The logger may be opening or truncating the file during startup.
+            pass
+        except Exception:
+            log.exception("Asynchronous RenderNet plot update failed")
+        if stopping:
+            return
+
+
 class RenderNetTrainingLogger(JsonLogger):
-    def __init__(self, directory, plot_every_steps=100):
+    def __init__(self, directory, plot_every_steps=100, enable_plots=True,
+                 async_plots=True, plot_interval_sec=20.0):
         self.directory = Path(directory)
-        super().__init__(str(self.directory / "logs.json.txt"))
+        super().__init__(str(self.directory / "logs.json.txt"), filter_fn=lambda key, value:
+                         isinstance(value, numbers.Number) or key in {
+                             "objective", "metric_name", "metric_scope", "selection_metric", "training_stage",
+                             "student_state_key"})
         self.history = MetricHistory()
+        self.enable_plots = bool(enable_plots)
+        self.async_plots = bool(async_plots)
+        self.plot_interval_sec = float(plot_interval_sec)
+        if self.plot_interval_sec <= 0:
+            raise ValueError("logging.plot_interval_sec must be positive")
         self.plot_every_steps = int(plot_every_steps)
         if self.plot_every_steps < 0:
             raise ValueError("logging.plot_every_steps must be nonnegative (0 = epoch only)")
+        self._plot_process = None
+        self._plot_request = None
+        self._plot_stop = None
+        self.curve_records = []
 
     def start(self):
         super().start()
-        self.history = MetricHistory.from_json(self.path)
+        self.curve_records = export_curve_log(self.path, self.directory / "log.json")
+        if self.enable_plots:
+            self.history = MetricHistory.from_json(self.path)
+            if self.async_plots:
+                context = mp.get_context("spawn")
+                self._plot_request = context.Event()
+                self._plot_stop = context.Event()
+                self._plot_process = context.Process(
+                    target=_plot_worker,
+                    args=(self.path, self.directory / "training_metrics.png",
+                          self._plot_request, self._plot_stop, self.plot_interval_sec),
+                    name="render-net-plotter",
+                    daemon=True,
+                )
+                self._plot_process.start()
+
+    def stop(self):
+        if self._plot_process is not None:
+            # Request one final plot before closing the JSON file, then wait
+            # briefly so the PNG is complete when the training run exits.
+            self._plot_stop.set()
+            self._plot_request.set()
+            self._plot_process.join(timeout=30.0)
+            if self._plot_process.is_alive():
+                self._plot_process.terminate()
+                self._plot_process.join(timeout=5.0)
+            self._plot_process = None
+            self._plot_request = None
+            self._plot_stop = None
+        super().stop()
 
     def log(self, data):
         super().log(data)
+        if is_curve_record(data):
+            self.curve_records.append(self.get_last_log())
+            save_curve_log(self.curve_records, self.directory / "log.json")
+        if not self.enable_plots:
+            return
         self.history.record(self.get_last_log())
         step = data.get("global_step", 0)
         if (self.plot_every_steps and "train_mse" in data
@@ -150,4 +503,9 @@ class RenderNetTrainingLogger(JsonLogger):
             self.save_plot()
 
     def save_plot(self):
+        if not self.enable_plots:
+            return None
+        if self.async_plots:
+            self._plot_request.set()
+            return self.directory / "training_metrics.png"
         return save_training_plot(self.history, self.directory / "training_metrics.png")
